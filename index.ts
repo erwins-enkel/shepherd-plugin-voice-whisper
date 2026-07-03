@@ -3,9 +3,10 @@
 // (the only dir Shepherd's loader scans) and restarting Shepherd.
 //
 // What it does: exposes two operator-auth'd HTTP routes under /api/plugins/voice-whisper/
-//   • POST transcribe — accepts a recorded audio clip (multipart `file`, optional `lang`),
-//     converts it to 16 kHz mono WAV with ffmpeg, runs it through the whisper.cpp CLI, and
-//     returns { text }. Shepherd's core compose-bar mic calls this.
+//   • POST transcribe — accepts a recorded audio clip (multipart `file`, optional `lang`) and
+//     returns { text }. Two backends: an opt-in faster-whisper HTTP server (config `serverUrl`,
+//     preferred when reachable), else the local whisper.cpp CLI (ffmpeg → 16 kHz mono WAV → CLI).
+//     Shepherd's core compose-bar mic calls this.
 //   • GET  status    — detection result { available, engine, model, ffmpeg, … } the core UI
 //     reads (memoized) to decide whether to offer/prefer the local mic.
 // It also publishes the detection state to the Settings → Plugins panel.
@@ -35,6 +36,16 @@ interface VoiceWhisperConfig {
   modelSize?: string;
   /** Absolute path to ffmpeg. Default: auto-detect on PATH. */
   ffmpegPath?: string;
+  /** Explicit base URL of a faster-whisper HTTP server (the `whisper-stt` server.py contract:
+   *  GET /health + POST /transcribe). When set it is the ONLY URL probed and, if reachable, is
+   *  preferred over the local CLI (no ffmpeg / local model needed). This is the one way to point at
+   *  an OFF-HOST server — which sends recorded audio to it. Not the OpenAI-compatible
+   *  `/v1/audio/transcriptions` nor whisper.cpp's `/inference`. Unset ⇒ localhost auto-discovery below. */
+  serverUrl?: string;
+  /** When `serverUrl` is unset, auto-discover a faster-whisper server on the LOCALHOST default
+   *  candidate(s) — trusting one only if it passes the strict /health contract. Default `true`; set
+   *  `false` to disable all probing. Discovery is localhost-only and never sends audio off-host. */
+  serverDiscovery?: boolean;
   /** Pin transcription language. "de"/"en" force it; "auto" defers to the request's UI locale. Default "auto". */
   language?: "auto" | "de" | "en";
   /** When true, the core mic prefers local whisper even where the browser's Web Speech API works. Default false. */
@@ -48,6 +59,10 @@ export interface ResolvedConfig {
   model: string | null;
   modelSize: string;
   ffmpegPath: string | null;
+  /** Explicit faster-whisper server URL (normalized), or null to use localhost discovery. */
+  serverUrl: string | null;
+  /** Auto-discover a localhost faster-whisper server when `serverUrl` is null. */
+  serverDiscovery: boolean;
   language: "auto" | "de" | "en";
   preferLocal: boolean;
   maxBytes: number;
@@ -55,16 +70,25 @@ export interface ResolvedConfig {
 
 const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
 const RUN_TIMEOUT_MS = 120_000;
+const PROBE_TIMEOUT_MS = 1_500;
 
-function readConfig(raw: Record<string, unknown>): ResolvedConfig {
+/** Localhost URLs auto-probed when `serverUrl` is unset and discovery is on. Localhost-only by
+ *  design so discovery never sends audio off-host; `9876` is the `whisper-stt` server.py default. */
+export const DEFAULT_SERVER_CANDIDATES = ["http://127.0.0.1:9876"];
+
+export function readConfig(raw: Record<string, unknown>): ResolvedConfig {
   const c = raw as VoiceWhisperConfig;
   const str = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
   const lang = c.language === "de" || c.language === "en" ? c.language : "auto";
+  const serverUrl = str(c.serverUrl);
   return {
     binaryPath: str(c.binaryPath),
     model: str(c.model),
     modelSize: str(c.modelSize) ?? "small",
     ffmpegPath: str(c.ffmpegPath),
+    // Strip any trailing slash so `${serverUrl}/health` is well-formed. Empty/absent → discovery.
+    serverUrl: serverUrl ? serverUrl.replace(/\/+$/, "") : null,
+    serverDiscovery: c.serverDiscovery !== false,
     language: lang,
     preferLocal: c.preferLocal === true,
     maxBytes: typeof c.maxBytes === "number" && c.maxBytes > 0 ? c.maxBytes : DEFAULT_MAX_BYTES,
@@ -139,20 +163,37 @@ export function resolveLang(cfg: ResolvedConfig, requested: string | null): stri
 
 // ── detection ─────────────────────────────────────────────────────────────────────────
 
+export type Engine = "server" | "whisper.cpp";
+
 export interface DetectDeps {
   which: (cmd: string) => string | null;
   exists: (path: string) => Promise<boolean>;
   /** Basenames in `dir`, or [] when the dir is missing. */
   listDir: (dir: string) => Promise<string[]>;
   home: () => string;
+  /** GET <url>/health. Resolves the server's model ONLY when it reports `ready:true` with a
+   *  plausible non-empty model name; null on unreachable / wrong shape / not ready. */
+  probeServer: (url: string) => Promise<{ model: string } | null>;
 }
 
 export interface Detection {
+  /** The backend that will actually be used (null when none is ready). */
+  engine: Engine | null;
+  /** A reachable, ready faster-whisper server, if `serverUrl` was set and it answered. */
+  server: { url: string; model: string } | null;
   ffmpeg: string | null;
   binary: string | null;
   model: string | null;
   /** Actionable, copy-paste guidance for whatever is missing (empty when ready). */
   hint: string;
+}
+
+/** Strict `/health` acceptance: trust a server ONLY when it reports `ready:true` with a plausible
+ *  non-empty model name. Guards against POSTing audio to an unrelated service on the configured URL. */
+export function acceptHealth(body: unknown): { model: string } | null {
+  const b = (body ?? {}) as { ready?: unknown; model?: unknown };
+  if (b.ready === true && typeof b.model === "string" && b.model.trim()) return { model: b.model };
+  return null;
 }
 
 async function resolveBinary(cfg: ResolvedConfig, d: DetectDeps): Promise<string | null> {
@@ -172,24 +213,60 @@ async function resolveModel(cfg: ResolvedConfig, d: DetectDeps): Promise<string 
 }
 
 export async function detect(cfg: ResolvedConfig, d: DetectDeps): Promise<Detection> {
+  // Which URLs to probe: an explicit serverUrl is the ONLY candidate (and may be off-host); else
+  // auto-discover on the localhost defaults when discovery is on. First one that passes the strict
+  // /health contract wins — so we never POST audio to a service that isn't a whisper server.
+  const candidates = cfg.serverUrl
+    ? [cfg.serverUrl]
+    : cfg.serverDiscovery
+      ? DEFAULT_SERVER_CANDIDATES
+      : [];
+  let server: { url: string; model: string } | null = null;
+  for (const url of candidates) {
+    const probed = await d.probeServer(url);
+    if (probed) {
+      server = { url, model: probed.model };
+      break;
+    }
+  }
+
   const ffmpeg =
     cfg.ffmpegPath && (await d.exists(cfg.ffmpegPath)) ? cfg.ffmpegPath : d.which("ffmpeg");
   const binary = await resolveBinary(cfg, d);
   const model = await resolveModel(cfg, d);
+  const cliReady = !!(ffmpeg && binary && model);
 
-  const missing: string[] = [];
-  if (!ffmpeg) missing.push("Install ffmpeg (e.g. `brew install ffmpeg` or `apt install ffmpeg`).");
-  if (!binary)
-    missing.push(
-      "Install whisper.cpp (e.g. `brew install whisper-cpp`) or set `binaryPath` in config.json.",
-    );
-  if (!model) {
-    const home = join(d.home(), ".shepherd", "whisper");
-    missing.push(
-      `Download a GGML model into ${home}/, e.g.: mkdir -p ${home} && curl -L -o ${home}/ggml-${cfg.modelSize}.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${cfg.modelSize}.bin`,
-    );
+  // Server first (warm model, no local ffmpeg/model), then the whisper.cpp CLI.
+  const engine: Engine | null = server ? "server" : cliReady ? "whisper.cpp" : null;
+
+  let hint = "";
+  if (!engine) {
+    const missing: string[] = [];
+    if (!ffmpeg)
+      missing.push("Install ffmpeg (e.g. `brew install ffmpeg` or `apt install ffmpeg`).");
+    if (!binary)
+      missing.push(
+        "Install whisper.cpp (e.g. `brew install whisper-cpp`) or set `binaryPath` in config.json.",
+      );
+    if (!model) {
+      const home = join(d.home(), ".shepherd", "whisper");
+      missing.push(
+        `Download a GGML model into ${home}/, e.g.: mkdir -p ${home} && curl -L -o ${home}/ggml-${cfg.modelSize}.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${cfg.modelSize}.bin`,
+      );
+    }
+    if (cfg.serverUrl)
+      missing.push(`Or start the faster-whisper server at ${cfg.serverUrl} (config \`serverUrl\`).`);
+    else if (cfg.serverDiscovery)
+      missing.push(
+        `Or run a faster-whisper server on ${DEFAULT_SERVER_CANDIDATES.join(", ")} (auto-discovered), or set \`serverUrl\` in config.json.`,
+      );
+    else
+      missing.push(
+        "Or enable the server backend: set `serverUrl` (or `serverDiscovery: true`) in config.json.",
+      );
+    hint = missing.join(" · ");
   }
-  return { ffmpeg: ffmpeg ?? null, binary, model, hint: missing.join(" · ") };
+  return { engine, server, ffmpeg: ffmpeg ?? null, binary, model, hint };
 }
 
 // ── transcription (injectable runner + IO for tests) ─────────────────────────────────
@@ -242,6 +319,101 @@ export async function runTranscription(opts: {
   }
 }
 
+// ── faster-whisper server backend (injectable poster for tests) ──────────────────────
+
+/** Thrown when the chosen server engine is unreachable AND no CLI fallback is available. The
+ *  route maps this to 503 (engine not ready) rather than a generic 500 (transcription failed). */
+export class ServerUnavailable extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ServerUnavailable";
+  }
+}
+
+/** POST the clip to `<url>/transcribe` (multipart `file` + optional `language`) and return the
+ *  raw JSON. Kept as a seam so tests drive the server path without a live server. */
+export type ServerPoster = (opts: {
+  url: string;
+  bytes: Uint8Array;
+  ext: string;
+  lang: string | null;
+  timeoutMs: number;
+}) => Promise<{ status: number; body: { text?: string; error?: string } }>;
+
+/** Send a clip to the faster-whisper server and return its text. Throws on non-2xx or missing text
+ *  (faster-whisper decodes webm/ogg/mp4 itself, so no ffmpeg/local model is involved here). */
+export async function runServerTranscription(opts: {
+  url: string;
+  bytes: Uint8Array;
+  ext: string;
+  lang: string | null;
+  post: ServerPoster;
+  timeoutMs?: number;
+}): Promise<string> {
+  const timeoutMs = opts.timeoutMs ?? RUN_TIMEOUT_MS;
+  const res = await opts.post({
+    url: opts.url,
+    bytes: opts.bytes,
+    ext: opts.ext,
+    lang: opts.lang,
+    timeoutMs,
+  });
+  if (res.status < 200 || res.status >= 300)
+    throw new Error(`server /transcribe returned ${res.status}: ${res.body?.error ?? ""}`.trim());
+  const text = res.body?.text;
+  if (typeof text !== "string") throw new Error("server /transcribe returned no text");
+  return text.trim();
+}
+
+/** Run the clip through whatever engine `detect()` selected, with a post-time safety net: if the
+ *  server was ready at detect() but has since gone away, fall back to the whisper.cpp CLI when it is
+ *  ready; otherwise throw {@link ServerUnavailable} (→ 503), never an unhandled 500. */
+export async function transcribeClip(opts: {
+  detection: Detection;
+  bytes: Uint8Array;
+  ext: string;
+  lang: string | null;
+  run: CmdRunner;
+  io: TranscribeIO;
+  post: ServerPoster;
+  timeoutMs?: number;
+}): Promise<string> {
+  const d = opts.detection;
+  const cliReady = !!(d.ffmpeg && d.binary && d.model);
+
+  if (d.engine === "server" && d.server) {
+    try {
+      return await runServerTranscription({
+        url: d.server.url,
+        bytes: opts.bytes,
+        ext: opts.ext,
+        lang: opts.lang,
+        post: opts.post,
+        timeoutMs: opts.timeoutMs,
+      });
+    } catch (e) {
+      if (!cliReady)
+        throw new ServerUnavailable(
+          `whisper server unreachable: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      // server vanished between detect() and POST but a local CLI is ready — degrade to it.
+    }
+  }
+
+  if (!cliReady) throw new ServerUnavailable("no transcription engine available");
+  return runTranscription({
+    bytes: opts.bytes,
+    ext: opts.ext,
+    lang: opts.lang,
+    ffmpeg: d.ffmpeg!,
+    binary: d.binary!,
+    model: d.model!,
+    run: opts.run,
+    io: opts.io,
+    timeoutMs: opts.timeoutMs,
+  });
+}
+
 // ── real runtime adapters ────────────────────────────────────────────────────────────
 
 const realDetectDeps: DetectDeps = {
@@ -262,6 +434,46 @@ const realDetectDeps: DetectDeps = {
     }
   },
   home: () => homedir(),
+  probeServer: async (url) => {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
+      try {
+        const res = await fetch(`${url}/health`, { signal: ctrl.signal });
+        if (!res.ok) return null;
+        return acceptHealth(await res.json());
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch {
+      return null;
+    }
+  },
+};
+
+const realServerPost: ServerPoster = async ({ url, bytes, ext, lang, timeoutMs }) => {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const form = new FormData();
+    const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    form.append("file", new Blob([buf]), `clip.${ext}`);
+    if (lang) form.append("language", lang);
+    const res = await fetch(`${url}/transcribe`, {
+      method: "POST",
+      body: form,
+      signal: ctrl.signal,
+    });
+    let body: { text?: string; error?: string } = {};
+    try {
+      body = (await res.json()) as { text?: string; error?: string };
+    } catch {
+      /* non-JSON error body — leave body empty, status carries the failure */
+    }
+    return { status: res.status, body };
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
 const realRun: CmdRunner = async (cmd, timeoutMs) => {
@@ -301,12 +513,22 @@ const realIO: TranscribeIO = {
 
 // ── plugin entry ─────────────────────────────────────────────────────────────────────
 
+/** Human-readable label for the selected engine (display-only; core gates on `available`). */
+function engineLabel(engine: Engine | null): string | null {
+  return engine === "server"
+    ? "faster-whisper server (whisper-stt)"
+    : engine === "whisper.cpp"
+      ? "whisper.cpp"
+      : null;
+}
+
 function statusBody(cfg: ResolvedConfig, d: Detection) {
   return {
-    available: !!(d.ffmpeg && d.binary && d.model),
-    engine: d.binary ? "whisper.cpp" : null,
+    available: d.engine !== null,
+    engine: engineLabel(d.engine),
+    server: d.server,
     binary: d.binary,
-    model: d.model,
+    model: d.engine === "server" ? (d.server?.model ?? null) : d.model,
     ffmpeg: !!d.ffmpeg,
     language: cfg.language,
     preferLocal: cfg.preferLocal,
@@ -315,7 +537,14 @@ function statusBody(cfg: ResolvedConfig, d: Detection) {
 }
 
 function panelView(cfg: ResolvedConfig, d: Detection): PluginUIView {
-  const available = !!(d.ffmpeg && d.binary && d.model);
+  const available = d.engine !== null;
+  const serverRow = d.server
+    ? `✓ ${d.server.url} (model ${d.server.model})`
+    : cfg.serverUrl
+      ? `✗ not reachable (${cfg.serverUrl})`
+      : cfg.serverDiscovery
+        ? `✗ none found (probed ${DEFAULT_SERVER_CANDIDATES.join(", ")})`
+        : "— disabled";
   const root: PluginUIView["root"] = {
     type: "stack",
     children: [
@@ -323,9 +552,11 @@ function panelView(cfg: ResolvedConfig, d: Detection): PluginUIView {
         type: "key-value",
         props: {
           pairs: [
-            { key: "ffmpeg", value: d.ffmpeg ? `✓ ${d.ffmpeg}` : "✗ not found" },
+            { key: "server", value: serverRow },
             { key: "whisper.cpp", value: d.binary ? `✓ ${d.binary}` : "✗ not found" },
+            { key: "ffmpeg", value: d.ffmpeg ? `✓ ${d.ffmpeg}` : "✗ not found" },
             { key: "model", value: d.model ? `✓ ${d.model}` : "✗ not found" },
+            { key: "engine", value: engineLabel(d.engine) ?? "none" },
             { key: "language", value: cfg.language },
             { key: "prefer local", value: cfg.preferLocal ? "yes" : "no (browser first)" },
             { key: "status", value: available ? "ready" : "not ready" },
@@ -375,25 +606,27 @@ export async function register(ctx: PluginContext): Promise<() => void> {
       return Response.json({ error: "clip too large" }, { status: 413 });
 
     const d = await detect(cfg, realDetectDeps);
-    if (!d.ffmpeg || !d.binary || !d.model)
+    if (!d.engine)
       return Response.json({ error: "voice engine not ready", hint: d.hint }, { status: 503 });
 
     const langField = form?.get("lang");
     const lang = resolveLang(cfg, typeof langField === "string" ? langField : null);
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
-      const text = await runTranscription({
+      const text = await transcribeClip({
+        detection: d,
         bytes,
         ext: extForMime(file.type),
         lang,
-        ffmpeg: d.ffmpeg,
-        binary: d.binary,
-        model: d.model,
         run: realRun,
         io: realIO,
+        post: realServerPost,
       });
       return Response.json({ text });
     } catch (e) {
+      // Server chosen at detect() but gone at POST, with no CLI fallback → 503 (not ready), not 500.
+      if (e instanceof ServerUnavailable)
+        return Response.json({ error: "voice engine not ready", hint: d.hint }, { status: 503 });
       ctx.log.warn(`transcribe failed: ${e instanceof Error ? e.message : String(e)}`);
       return Response.json({ error: "transcription failed" }, { status: 500 });
     }

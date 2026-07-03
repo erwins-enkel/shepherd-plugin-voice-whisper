@@ -6,10 +6,18 @@ import {
   parseTranscript,
   resolveLang,
   detect,
+  readConfig,
+  acceptHealth,
+  DEFAULT_SERVER_CANDIDATES,
   runTranscription,
+  runServerTranscription,
+  transcribeClip,
+  ServerUnavailable,
   type ResolvedConfig,
+  type Detection,
   type DetectDeps,
   type CmdResult,
+  type ServerPoster,
   type TranscribeIO,
 } from "./index";
 
@@ -19,6 +27,8 @@ function cfg(over: Partial<ResolvedConfig> = {}): ResolvedConfig {
     model: null,
     modelSize: "small",
     ffmpegPath: null,
+    serverUrl: null,
+    serverDiscovery: false,
     language: "auto",
     preferLocal: false,
     maxBytes: 25 * 1024 * 1024,
@@ -84,6 +94,7 @@ function detectDeps(over: Partial<DetectDeps> = {}): DetectDeps {
     exists: async () => false,
     listDir: async () => [],
     home: () => "/home/me",
+    probeServer: async () => null,
     ...over,
   };
 }
@@ -200,4 +211,185 @@ test("runTranscription: ffmpeg failure throws AND still cleans up temp files", a
   expect(h.calls.length).toBe(1); // whisper never ran
   expect(h.removed).toContain("/tmp/clip.webm");
   expect(h.removed).toContain("/tmp/clip.wav");
+});
+
+// ── faster-whisper server backend ────────────────────────────────────────────────────
+
+test("readConfig serverUrl: non-empty sets explicit URL (trailing slash stripped); absent/empty → null", () => {
+  expect(readConfig({}).serverUrl).toBe(null);
+  expect(readConfig({ serverUrl: "" }).serverUrl).toBe(null);
+  expect(readConfig({ serverUrl: "http://127.0.0.1:9876/" }).serverUrl).toBe("http://127.0.0.1:9876");
+  expect(readConfig({ serverUrl: "http://127.0.0.1:9876" }).serverUrl).toBe("http://127.0.0.1:9876");
+});
+
+test("readConfig serverDiscovery defaults on, only false turns it off", () => {
+  expect(readConfig({}).serverDiscovery).toBe(true);
+  expect(readConfig({ serverDiscovery: true }).serverDiscovery).toBe(true);
+  expect(readConfig({ serverDiscovery: false }).serverDiscovery).toBe(false);
+});
+
+test("acceptHealth trusts only ready:true + a plausible non-empty model", () => {
+  expect(acceptHealth({ status: "ok", ready: true, model: "medium" })).toEqual({ model: "medium" });
+  expect(acceptHealth({ status: "ok", ready: false, model: "medium" })).toBe(null); // not ready
+  expect(acceptHealth({ status: "ok", ready: true, model: "" })).toBe(null); // blank model
+  expect(acceptHealth({ status: "ok", ready: true })).toBe(null); // no model field
+  expect(acceptHealth({ status: "ok" })).toBe(null); // some unrelated /health
+  expect(acceptHealth(null)).toBe(null);
+});
+
+test("detect: an explicit serverUrl is the only URL probed and wins over a ready CLI", async () => {
+  const probed: string[] = [];
+  const readyCli = detectDeps({
+    which: (c) => (c === "ffmpeg" ? "/ff" : c === "whisper-cli" ? "/wc" : null),
+    listDir: async (dir) => (dir === "/home/me/.shepherd/whisper" ? ["ggml-small.bin"] : []),
+    probeServer: async (url) => {
+      probed.push(url);
+      return { model: "medium" };
+    },
+  });
+  const d = await detect(cfg({ serverUrl: "http://s:9876" }), readyCli);
+  expect(probed).toEqual(["http://s:9876"]); // NOT the discovery candidates
+  expect(d.engine).toBe("server");
+  expect(d.server).toEqual({ url: "http://s:9876", model: "medium" });
+  expect(d.hint).toBe("");
+});
+
+test("detect: discovery probes the localhost candidates and adopts a healthy one", async () => {
+  const probed: string[] = [];
+  const d = await detect(
+    cfg({ serverDiscovery: true }), // no serverUrl → discover
+    detectDeps({
+      probeServer: async (url) => {
+        probed.push(url);
+        return { model: "medium" };
+      },
+    }),
+  );
+  expect(probed).toEqual(DEFAULT_SERVER_CANDIDATES);
+  expect(d.engine).toBe("server");
+  expect(d.server).toEqual({ url: DEFAULT_SERVER_CANDIDATES[0]!, model: "medium" });
+});
+
+test("detect: discovery disabled (and no serverUrl) never probes → CLI", async () => {
+  const probed: string[] = [];
+  const d = await detect(
+    cfg({ serverDiscovery: false }),
+    detectDeps({
+      which: (c) => (c === "ffmpeg" ? "/ff" : c === "whisper-cli" ? "/wc" : null),
+      listDir: async () => ["ggml-small.bin"],
+      probeServer: async (url) => {
+        probed.push(url);
+        return { model: "medium" };
+      },
+    }),
+  );
+  expect(probed).toEqual([]);
+  expect(d.engine).toBe("whisper.cpp");
+});
+
+test("detect falls back to the CLI when the server is unreachable/rejected", async () => {
+  const d = await detect(
+    cfg({ serverUrl: "http://s:9876" }),
+    detectDeps({
+      which: (c) => (c === "ffmpeg" ? "/ff" : c === "whisper-cli" ? "/wc" : null),
+      listDir: async () => ["ggml-small.bin"],
+      probeServer: async () => null, // not reachable / rejected by strict /health
+    }),
+  );
+  expect(d.engine).toBe("whisper.cpp");
+  expect(d.server).toBe(null);
+});
+
+test("detect: no server + no CLI → engine null with a hint that mentions serverUrl", async () => {
+  const d = await detect(cfg(), detectDeps());
+  expect(d.engine).toBe(null);
+  expect(d.hint).toContain("serverUrl");
+});
+
+test("runServerTranscription returns trimmed text; throws on non-2xx and on missing text", async () => {
+  const ok: ServerPoster = async () => ({ status: 200, body: { text: "  hallo welt \n" } });
+  expect(
+    await runServerTranscription({ url: "http://s", bytes: new Uint8Array([1]), ext: "webm", lang: "de", post: ok }),
+  ).toBe("hallo welt");
+
+  const err: ServerPoster = async () => ({ status: 500, body: { error: "boom" } });
+  await expect(
+    runServerTranscription({ url: "http://s", bytes: new Uint8Array([1]), ext: "webm", lang: null, post: err }),
+  ).rejects.toThrow(/500/);
+
+  const empty: ServerPoster = async () => ({ status: 200, body: {} });
+  await expect(
+    runServerTranscription({ url: "http://s", bytes: new Uint8Array([1]), ext: "webm", lang: null, post: empty }),
+  ).rejects.toThrow(/no text/);
+});
+
+// The race the plan calls out: server chosen at detect() but gone at POST.
+function serverDetection(over: Partial<Detection> = {}): Detection {
+  return {
+    engine: "server",
+    server: { url: "http://s:9876", model: "medium" },
+    ffmpeg: null,
+    binary: null,
+    model: null,
+    hint: "",
+    ...over,
+  };
+}
+
+test("transcribeClip: server down at POST degrades to the CLI when it is ready", async () => {
+  const h = harness((cmd) =>
+    cmd[0] === "/ff"
+      ? { exitCode: 0, stdout: "", stderr: "" }
+      : { exitCode: 0, stdout: "fallback text\n", stderr: "" },
+  );
+  const throwingPost: ServerPoster = async () => {
+    throw new Error("ECONNREFUSED");
+  };
+  // server engine, but the CLI is also ready → fall back to it, not a 503/500.
+  const text = await transcribeClip({
+    detection: serverDetection({ ffmpeg: "/ff", binary: "/wc", model: "/m.bin" }),
+    bytes: new Uint8Array([1, 2]),
+    ext: "webm",
+    lang: null,
+    run: h.run,
+    io: h.io,
+    post: throwingPost,
+  });
+  expect(text).toBe("fallback text");
+  expect(h.calls[0]![0]).toBe("/ff"); // CLI pipeline actually ran
+});
+
+test("transcribeClip: server down at POST with no CLI throws ServerUnavailable (→ 503, not 500)", async () => {
+  const h = harness(() => ({ exitCode: 0, stdout: "", stderr: "" }));
+  const throwingPost: ServerPoster = async () => {
+    throw new Error("ECONNREFUSED");
+  };
+  await expect(
+    transcribeClip({
+      detection: serverDetection(), // no ffmpeg/binary/model
+      bytes: new Uint8Array([1]),
+      ext: "webm",
+      lang: null,
+      run: h.run,
+      io: h.io,
+      post: throwingPost,
+    }),
+  ).rejects.toBeInstanceOf(ServerUnavailable);
+  expect(h.calls.length).toBe(0); // never touched the CLI
+});
+
+test("transcribeClip: happy server path returns the server's text without touching the CLI", async () => {
+  const h = harness(() => ({ exitCode: 0, stdout: "should not run", stderr: "" }));
+  const post: ServerPoster = async () => ({ status: 200, body: { text: "server text" } });
+  const text = await transcribeClip({
+    detection: serverDetection({ ffmpeg: "/ff", binary: "/wc", model: "/m.bin" }),
+    bytes: new Uint8Array([1]),
+    ext: "webm",
+    lang: "de",
+    run: h.run,
+    io: h.io,
+    post,
+  });
+  expect(text).toBe("server text");
+  expect(h.calls.length).toBe(0);
 });
