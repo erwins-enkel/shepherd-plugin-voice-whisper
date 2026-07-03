@@ -59,6 +59,7 @@ const cfg = {
   language: "auto" as const,
   preferLocal: false,
   maxBytes: 100 * 1024 * 1024,
+  maxConcurrent: 3,
 };
 
 const post: ServerPoster = async ({ url, bytes, ext, lang }) => {
