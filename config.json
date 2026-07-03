@@ -1,5 +1,6 @@
 {
   "language": "auto",
   "modelSize": "small",
-  "preferLocal": false
+  "preferLocal": false,
+  "serverUrl": ""
 }

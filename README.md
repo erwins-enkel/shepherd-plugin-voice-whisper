@@ -2,8 +2,23 @@
 
 The **local Whisper transcription backend** for [Shepherd](https://github.com/erwins-enkel/shepherd)'s
 compose-bar voice input (Shepherd issue #76). It records nothing itself — Shepherd's compose bar
-captures the audio in the browser and POSTs it here; this plugin converts the clip with **ffmpeg**
-and transcribes it with the **whisper.cpp** CLI, entirely on the host. Nothing leaves your machine.
+captures the audio in the browser and POSTs it here. Two backends, picked automatically:
+
+1. **faster-whisper HTTP server** (opt-in) — when you set `serverUrl` and that server is reachable,
+   the clip is forwarded to it (it decodes the audio and keeps the model warm, so **no local ffmpeg
+   or model file is needed**). Preferred over the CLI when available.
+2. **whisper.cpp CLI** (default) — the clip is converted with **ffmpeg** and transcribed by the
+   whisper.cpp CLI on the host.
+
+**Privacy:** with the default CLI backend, or a `serverUrl` on **`localhost`/`127.0.0.1`**, nothing
+leaves your machine. ⚠️ Pointing `serverUrl` at a **non-localhost** host sends the raw recorded audio
+off-box to that server — only do that if you trust it.
+
+> **Server backend scope.** The `serverUrl` backend speaks one specific contract — `GET /health`
+> (`{"ready":true,"model":"…"}`) and `POST /transcribe` (multipart `file`, returns `{ "text": … }`),
+> as served by the `whisper-stt` `server.py`. It is **not** the OpenAI-compatible
+> `faster-whisper-server`/speaches `POST /v1/audio/transcriptions`, nor whisper.cpp's `whisper-server`
+> `POST /inference`. Point `serverUrl` at a server that speaks the `/health` + `/transcribe` contract.
 
 > **Why the feature spans two repos.** Shepherd's plugin system is server-side and in-process — a
 > plugin can't run browser JS (`getUserMedia` / `MediaRecorder`) or add a button to the compose bar.
@@ -16,7 +31,10 @@ and transcribes it with the **whisper.cpp** CLI, entirely on the host. Nothing l
 
 ## Prerequisites
 
-Three things on the host that runs herdr:
+**Server backend:** just a running faster-whisper server and `"serverUrl"` pointing at it — no
+ffmpeg, model, or CLI needed on the herdr host. Skip the three items below if you use it.
+
+**CLI backend** — three things on the host that runs herdr:
 
 1. **ffmpeg** on `PATH` — `brew install ffmpeg` / `apt install ffmpeg` / `pacman -S ffmpeg`.
 2. **whisper.cpp CLI** on `PATH` — `brew install whisper-cpp` (Homebrew names the binary
@@ -35,8 +53,13 @@ Three things on the host that runs herdr:
    (~1.6 GB) is best on Apple Silicon. Use the **multilingual** models (no `.en` suffix). Or set
    `model` in `config.json` to a model you already have.
 
-The **Settings → Plugins** panel shows exactly which of the three are detected, and the status
-row / `GET status` route carry a copy-paste hint for whatever is missing.
+The **Settings → Plugins** panel shows the server row plus which of the three CLI pieces are
+detected and which engine is selected, and the status row / `GET status` route carry a copy-paste
+hint for whatever is missing.
+
+> **whisper.cpp built from source but not on `PATH`?** Point `binaryPath` at it, e.g.
+> `"binaryPath": "/home/you/whisper.cpp/build/bin/whisper-cli"` — otherwise the CLI backend reports
+> `not found` even though the binary exists.
 
 ## Install
 
@@ -56,6 +79,7 @@ compose-bar mic uses it (see `preferLocal` for the browser-vs-local choice).
 
 | Field         | Default   | Meaning                                                                                     |
 | ------------- | --------- | ------------------------------------------------------------------------------------------- |
+| `serverUrl`   | `""` (off) | Base URL of a faster-whisper server (`/health` + `/transcribe` contract). Set it to enable + prefer the server backend (`""`/absent = disabled, no probing). Non-localhost sends audio off-host. |
 | `binaryPath`  | auto      | Absolute path to the whisper.cpp CLI. Auto-detects `whisper-cli` → `whisper-cpp` on `PATH`. |
 | `model`       | auto      | Absolute path to a GGML model. Auto-scans `~/.shepherd/whisper/` for `ggml-<size>.bin`.     |
 | `modelSize`   | `"small"` | Which size to prefer when scanning + which the missing-model hint suggests.                 |
@@ -67,15 +91,21 @@ compose-bar mic uses it (see `preferLocal` for the browser-vs-local choice).
 ## Routes (behind Shepherd's operator auth)
 
 - `POST /api/plugins/voice-whisper/transcribe` — multipart `file` (audio blob) + optional
-  `lang` form field → `{ text }`. `413` over `maxBytes`; `503` `{ error, hint }` if ffmpeg /
-  whisper.cpp / model is missing.
-- `GET /api/plugins/voice-whisper/status` → `{ available, engine, model, ffmpeg, language,
-  preferLocal, hint }`.
+  `lang` form field → `{ text }`. `413` over `maxBytes`; `503` `{ error, hint }` when no engine is
+  ready (also when the server was chosen but is unreachable at send time and no CLI fallback exists).
+- `GET /api/plugins/voice-whisper/status` → `{ available, engine, server, model, ffmpeg, language,
+  preferLocal, hint }`. `engine` is `"faster-whisper server (whisper-stt)"` / `"whisper.cpp"` / `null`;
+  `server` is `{ url, model }` when a server is reachable, else `null`.
 
 ## Pipeline
 
-`clip → temp file → ffmpeg -ar 16000 -ac 1 -c:a pcm_s16le → temp WAV → whisper-cli -m <model>
--f <wav> -l <lang> -nt → text`. The clip is buffered to a **seekable temp file** before ffmpeg
+**Server backend:** `clip → POST <serverUrl>/transcribe (multipart file + language) → { text }`.
+faster-whisper decodes the browser's webm/ogg/mp4 itself, so there is no ffmpeg step and no local
+model. If the server is unreachable at send time, the request degrades to the CLI backend when it is
+ready, otherwise returns `503`.
+
+**CLI backend:** `clip → temp file → ffmpeg -ar 16000 -ac 1 -c:a pcm_s16le → temp WAV → whisper-cli
+-m <model> -f <wav> -l <lang> -nt → text`. The clip is buffered to a **seekable temp file** before ffmpeg
 (never `-i pipe:0`) because iOS `MediaRecorder` mp4 carries a trailing `moov` atom that fails to
 demux from a non-seekable pipe. Both temp files are always cleaned up.
 
@@ -89,6 +119,9 @@ bun run typecheck               # tsc against the vendored contract
 WHISPER_BIN=~/whisper.cpp/build/bin/whisper-cli \
 WHISPER_MODEL=~/whisper.cpp/models/ggml-small.bin \
 bun run smoke.ts /path/to/clip.wav de
+
+# or against a running faster-whisper server (preferred when set):
+WHISPER_SERVER_URL=http://127.0.0.1:9876 bun run smoke.ts /path/to/clip.wav de
 ```
 
 `types.ts` is vendored from Shepherd's `src/plugins/types.ts` (plugin API v1). If Shepherd bumps
