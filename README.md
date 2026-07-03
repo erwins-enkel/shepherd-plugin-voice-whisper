@@ -93,3 +93,14 @@ bun run smoke.ts /path/to/clip.wav de
 
 `types.ts` is vendored from Shepherd's `src/plugins/types.ts` (plugin API v1). If Shepherd bumps
 the plugin API, refresh it and bump `apiVersion` in `plugin.json`.
+
+## License
+
+This plugin is distributed as part of Shepherd and is licensed under the
+[Business Source License 1.1](./LICENSE) © 2026 Erwins Enkel GmbH, on the same terms as
+Shepherd itself. It is **source-available**, not open source: you may read, modify, and make
+non-production use freely, and production use is permitted **except** offering it to third parties
+as a competing hosted or embedded commercial service (see the Additional Use Grant in
+[`LICENSE`](./LICENSE)). Each version converts to the
+[Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) four years after it is published
+(its Change Date). For other arrangements, contact Erwins Enkel GmbH.
