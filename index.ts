@@ -52,6 +52,9 @@ interface VoiceWhisperConfig {
   preferLocal?: boolean;
   /** Reject clips larger than this many bytes (413). Default 25 MiB. */
   maxBytes?: number;
+  /** Max concurrent transcriptions before shedding with 429. Bounds host load when the compose bar
+   *  fires rapid live-preview requests (or several clients dictate at once). Default 3. */
+  maxConcurrent?: number;
 }
 
 export interface ResolvedConfig {
@@ -66,9 +69,14 @@ export interface ResolvedConfig {
   language: "auto" | "de" | "en";
   preferLocal: boolean;
   maxBytes: number;
+  maxConcurrent: number;
 }
 
 const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
+const DEFAULT_MAX_CONCURRENT = 3;
+/** Slots the load gate keeps free for a final transcription, so disposable `mode=partial` preview
+ *  requests can never 429-starve the one clip the user actually wants. */
+const RESERVED_FOR_FINAL = 1;
 const RUN_TIMEOUT_MS = 120_000;
 const PROBE_TIMEOUT_MS = 1_500;
 
@@ -92,6 +100,35 @@ export function readConfig(raw: Record<string, unknown>): ResolvedConfig {
     language: lang,
     preferLocal: c.preferLocal === true,
     maxBytes: typeof c.maxBytes === "number" && c.maxBytes > 0 ? c.maxBytes : DEFAULT_MAX_BYTES,
+    maxConcurrent:
+      typeof c.maxConcurrent === "number" && c.maxConcurrent >= 1
+        ? Math.floor(c.maxConcurrent)
+        : DEFAULT_MAX_CONCURRENT,
+  };
+}
+
+// ── concurrency gate (bounds host load; exported for unit tests) ──────────────────────
+
+/** A tiny counting gate: at most `max` holders at once. `tryEnter(reserved)` admits only while
+ *  `inFlight < max - reserved`, so a low-priority caller can pass `reserved > 0` to leave that many
+ *  slots free for higher-priority work. Every successful enter must be paired with a `leave()`.
+ *
+ *  This is how a disposable live-preview (`mode=partial`) request never starves the irreplaceable
+ *  final transcription: previews reserve a slot for the final, the final reserves none. */
+export function makeGate(max: number) {
+  let inFlight = 0;
+  return {
+    tryEnter(reserved = 0): boolean {
+      if (inFlight >= max - reserved) return false;
+      inFlight += 1;
+      return true;
+    },
+    leave(): void {
+      if (inFlight > 0) inFlight -= 1;
+    },
+    get inFlight(): number {
+      return inFlight;
+    },
   };
 }
 
@@ -572,8 +609,14 @@ function panelView(cfg: ResolvedConfig, d: Detection): PluginUIView {
 export async function register(ctx: PluginContext): Promise<() => void> {
   const cfg = readConfig(ctx.config);
   ctx.log.log(
-    `registering — language=${cfg.language} preferLocal=${cfg.preferLocal} modelSize=${cfg.modelSize}`,
+    `registering — language=${cfg.language} preferLocal=${cfg.preferLocal} modelSize=${cfg.modelSize} maxConcurrent=${cfg.maxConcurrent}`,
   );
+
+  // Bound concurrent whisper/ffmpeg subprocesses: the compose-bar live preview fires a fresh
+  // transcription every couple of seconds while dictating, so several tabs/sessions could otherwise
+  // stack unbounded whole-clip transcriptions on the host. A shed request gets 429 — the browser's
+  // interim loop silently skips that tick and retries on the next one.
+  const gate = makeGate(cfg.maxConcurrent);
 
   const refreshPanel = async (): Promise<Detection> => {
     const d = await detect(cfg, realDetectDeps);
@@ -611,6 +654,11 @@ export async function register(ctx: PluginContext): Promise<() => void> {
 
     const langField = form?.get("lang");
     const lang = resolveLang(cfg, typeof langField === "string" ? langField : null);
+    // Shed rather than pile on when the host is already at capacity. A disposable `mode=partial`
+    // live-preview request leaves a slot reserved for the final clip, so previews can never
+    // 429-starve the transcription the user actually keeps; absent/other `mode` ⇒ treated as final.
+    const reserved = form?.get("mode") === "partial" ? RESERVED_FOR_FINAL : 0;
+    if (!gate.tryEnter(reserved)) return Response.json({ error: "busy" }, { status: 429 });
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
       const text = await transcribeClip({
@@ -629,6 +677,8 @@ export async function register(ctx: PluginContext): Promise<() => void> {
         return Response.json({ error: "voice engine not ready", hint: d.hint }, { status: 503 });
       ctx.log.warn(`transcribe failed: ${e instanceof Error ? e.message : String(e)}`);
       return Response.json({ error: "transcription failed" }, { status: 500 });
+    } finally {
+      gate.leave();
     }
   });
 

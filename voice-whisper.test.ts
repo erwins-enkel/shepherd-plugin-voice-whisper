@@ -13,6 +13,7 @@ import {
   runServerTranscription,
   transcribeClip,
   ServerUnavailable,
+  makeGate,
   type ResolvedConfig,
   type Detection,
   type DetectDeps,
@@ -32,6 +33,7 @@ function cfg(over: Partial<ResolvedConfig> = {}): ResolvedConfig {
     language: "auto",
     preferLocal: false,
     maxBytes: 25 * 1024 * 1024,
+    maxConcurrent: 3,
     ...over,
   };
 }
@@ -392,4 +394,36 @@ test("transcribeClip: happy server path returns the server's text without touchi
   });
   expect(text).toBe("server text");
   expect(h.calls.length).toBe(0);
+});
+
+test("makeGate admits up to max concurrent holders, then sheds", () => {
+  const gate = makeGate(2);
+  expect(gate.tryEnter()).toBe(true);
+  expect(gate.tryEnter()).toBe(true);
+  expect(gate.inFlight).toBe(2);
+  expect(gate.tryEnter()).toBe(false); // full → shed
+  expect(gate.inFlight).toBe(2);
+});
+
+test("makeGate frees a slot on leave and never underflows", () => {
+  const gate = makeGate(1);
+  expect(gate.tryEnter()).toBe(true);
+  expect(gate.tryEnter()).toBe(false);
+  gate.leave();
+  expect(gate.inFlight).toBe(0);
+  gate.leave(); // extra leave is a no-op, not negative
+  expect(gate.inFlight).toBe(0);
+  expect(gate.tryEnter()).toBe(true); // slot reusable again
+});
+
+test("makeGate reserves slots so low-priority callers never starve a high-priority one", () => {
+  const gate = makeGate(3);
+  // disposable preview requests (reserved=1) fill only up to max-1…
+  expect(gate.tryEnter(1)).toBe(true);
+  expect(gate.tryEnter(1)).toBe(true);
+  expect(gate.inFlight).toBe(2);
+  expect(gate.tryEnter(1)).toBe(false); // last slot is held back for the final
+  // …and the final (reserved=0) always gets that reserved slot.
+  expect(gate.tryEnter(0)).toBe(true);
+  expect(gate.inFlight).toBe(3);
 });

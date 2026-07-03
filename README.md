@@ -92,12 +92,16 @@ compose-bar mic uses it (see `preferLocal` for the browser-vs-local choice).
 | `language`    | `"auto"`  | `"de"`/`"en"` pin the language; `"auto"` defers to the request's UI locale.                 |
 | `preferLocal` | `false`   | `true` → use local whisper even where the browser's Web Speech API works; `false` keeps the browser engine as the default and only uses local where the browser has none (iOS PWA). |
 | `maxBytes`    | 25 MiB    | Reject larger clips with `413`.                                                             |
+| `maxConcurrent` | `3`     | Max simultaneous transcriptions; excess requests get `429`. Bounds host load when the compose-bar live preview fires rapid requests or several clients dictate at once. |
 
 ## Routes (behind Shepherd's operator auth)
 
-- `POST /api/plugins/voice-whisper/transcribe` — multipart `file` (audio blob) + optional
-  `lang` form field → `{ text }`. `413` over `maxBytes`; `503` `{ error, hint }` when no engine is
-  ready (also when the server was chosen but is unreachable at send time and no CLI fallback exists).
+- `POST /api/plugins/voice-whisper/transcribe` — multipart `file` (audio blob) + optional `lang`
+  and `mode` (`partial` marks a disposable live-preview request; absent/other ⇒ the final clip) →
+  `{ text }`. `413` over `maxBytes`; `503` `{ error, hint }` when no engine is ready (also when the
+  server was chosen but is unreachable at send time and no CLI fallback exists); `429`
+  `{ error: "busy" }` when already at `maxConcurrent` — `mode=partial` requests keep a slot reserved
+  for the final, so a live preview can never shed the transcription the user actually keeps.
 - `GET /api/plugins/voice-whisper/status` → `{ available, engine, server, model, ffmpeg, language,
   preferLocal, hint }`. `engine` is `"faster-whisper server (whisper-stt)"` / `"whisper.cpp"` / `null`;
   `server` is `{ url, model }` when a server is reachable, else `null`.
