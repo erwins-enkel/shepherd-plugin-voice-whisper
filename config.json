@@ -2,5 +2,6 @@
   "language": "auto",
   "modelSize": "small",
   "preferLocal": false,
-  "serverUrl": ""
+  "serverUrl": "",
+  "serverDiscovery": true
 }

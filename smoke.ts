@@ -55,6 +55,7 @@ const cfg = {
   modelSize: "small",
   ffmpegPath: process.env.FFMPEG_BIN ?? null,
   serverUrl: process.env.WHISPER_SERVER_URL?.replace(/\/+$/, "") || null,
+  serverDiscovery: true,
   language: "auto" as const,
   preferLocal: false,
   maxBytes: 100 * 1024 * 1024,

@@ -36,11 +36,16 @@ interface VoiceWhisperConfig {
   modelSize?: string;
   /** Absolute path to ffmpeg. Default: auto-detect on PATH. */
   ffmpegPath?: string;
-  /** Base URL of a faster-whisper HTTP server (the `whisper-stt` server.py contract: GET /health
-   *  + POST /transcribe). When set AND reachable it is preferred over the local CLI (no ffmpeg /
-   *  local model needed). OPT-IN: unset/"" disables it — no probing happens. Not the OpenAI-compatible
-   *  `/v1/audio/transcriptions` nor whisper.cpp's `/inference`. A non-localhost URL sends audio off-host. */
+  /** Explicit base URL of a faster-whisper HTTP server (the `whisper-stt` server.py contract:
+   *  GET /health + POST /transcribe). When set it is the ONLY URL probed and, if reachable, is
+   *  preferred over the local CLI (no ffmpeg / local model needed). This is the one way to point at
+   *  an OFF-HOST server — which sends recorded audio to it. Not the OpenAI-compatible
+   *  `/v1/audio/transcriptions` nor whisper.cpp's `/inference`. Unset ⇒ localhost auto-discovery below. */
   serverUrl?: string;
+  /** When `serverUrl` is unset, auto-discover a faster-whisper server on the LOCALHOST default
+   *  candidate(s) — trusting one only if it passes the strict /health contract. Default `true`; set
+   *  `false` to disable all probing. Discovery is localhost-only and never sends audio off-host. */
+  serverDiscovery?: boolean;
   /** Pin transcription language. "de"/"en" force it; "auto" defers to the request's UI locale. Default "auto". */
   language?: "auto" | "de" | "en";
   /** When true, the core mic prefers local whisper even where the browser's Web Speech API works. Default false. */
@@ -54,8 +59,10 @@ export interface ResolvedConfig {
   model: string | null;
   modelSize: string;
   ffmpegPath: string | null;
-  /** Normalized base URL of the faster-whisper server, or null when disabled. */
+  /** Explicit faster-whisper server URL (normalized), or null to use localhost discovery. */
   serverUrl: string | null;
+  /** Auto-discover a localhost faster-whisper server when `serverUrl` is null. */
+  serverDiscovery: boolean;
   language: "auto" | "de" | "en";
   preferLocal: boolean;
   maxBytes: number;
@@ -64,6 +71,10 @@ export interface ResolvedConfig {
 const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
 const RUN_TIMEOUT_MS = 120_000;
 const PROBE_TIMEOUT_MS = 1_500;
+
+/** Localhost URLs auto-probed when `serverUrl` is unset and discovery is on. Localhost-only by
+ *  design so discovery never sends audio off-host; `9876` is the `whisper-stt` server.py default. */
+export const DEFAULT_SERVER_CANDIDATES = ["http://127.0.0.1:9876"];
 
 export function readConfig(raw: Record<string, unknown>): ResolvedConfig {
   const c = raw as VoiceWhisperConfig;
@@ -75,8 +86,9 @@ export function readConfig(raw: Record<string, unknown>): ResolvedConfig {
     model: str(c.model),
     modelSize: str(c.modelSize) ?? "small",
     ffmpegPath: str(c.ffmpegPath),
-    // Strip any trailing slash so `${serverUrl}/health` is well-formed. Empty/absent → disabled.
+    // Strip any trailing slash so `${serverUrl}/health` is well-formed. Empty/absent → discovery.
     serverUrl: serverUrl ? serverUrl.replace(/\/+$/, "") : null,
+    serverDiscovery: c.serverDiscovery !== false,
     language: lang,
     preferLocal: c.preferLocal === true,
     maxBytes: typeof c.maxBytes === "number" && c.maxBytes > 0 ? c.maxBytes : DEFAULT_MAX_BYTES,
@@ -201,9 +213,22 @@ async function resolveModel(cfg: ResolvedConfig, d: DetectDeps): Promise<string 
 }
 
 export async function detect(cfg: ResolvedConfig, d: DetectDeps): Promise<Detection> {
-  // Server is opt-in: probe ONLY when serverUrl is configured, so default installs never reach out.
-  const probed = cfg.serverUrl ? await d.probeServer(cfg.serverUrl) : null;
-  const server = probed ? { url: cfg.serverUrl!, model: probed.model } : null;
+  // Which URLs to probe: an explicit serverUrl is the ONLY candidate (and may be off-host); else
+  // auto-discover on the localhost defaults when discovery is on. First one that passes the strict
+  // /health contract wins — so we never POST audio to a service that isn't a whisper server.
+  const candidates = cfg.serverUrl
+    ? [cfg.serverUrl]
+    : cfg.serverDiscovery
+      ? DEFAULT_SERVER_CANDIDATES
+      : [];
+  let server: { url: string; model: string } | null = null;
+  for (const url of candidates) {
+    const probed = await d.probeServer(url);
+    if (probed) {
+      server = { url, model: probed.model };
+      break;
+    }
+  }
 
   const ffmpeg =
     cfg.ffmpegPath && (await d.exists(cfg.ffmpegPath)) ? cfg.ffmpegPath : d.which("ffmpeg");
@@ -229,9 +254,15 @@ export async function detect(cfg: ResolvedConfig, d: DetectDeps): Promise<Detect
         `Download a GGML model into ${home}/, e.g.: mkdir -p ${home} && curl -L -o ${home}/ggml-${cfg.modelSize}.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${cfg.modelSize}.bin`,
       );
     }
-    if (!cfg.serverUrl)
+    if (cfg.serverUrl)
+      missing.push(`Or start the faster-whisper server at ${cfg.serverUrl} (config \`serverUrl\`).`);
+    else if (cfg.serverDiscovery)
       missing.push(
-        "Or run a faster-whisper server and set `serverUrl` in config.json (e.g. http://127.0.0.1:9876).",
+        `Or run a faster-whisper server on ${DEFAULT_SERVER_CANDIDATES.join(", ")} (auto-discovered), or set \`serverUrl\` in config.json.`,
+      );
+    else
+      missing.push(
+        "Or enable the server backend: set `serverUrl` (or `serverDiscovery: true`) in config.json.",
       );
     hint = missing.join(" · ");
   }
@@ -507,11 +538,13 @@ function statusBody(cfg: ResolvedConfig, d: Detection) {
 
 function panelView(cfg: ResolvedConfig, d: Detection): PluginUIView {
   const available = d.engine !== null;
-  const serverRow = !cfg.serverUrl
-    ? "— disabled (set serverUrl)"
-    : d.server
-      ? `✓ ${d.server.url} (model ${d.server.model})`
-      : "✗ not reachable";
+  const serverRow = d.server
+    ? `✓ ${d.server.url} (model ${d.server.model})`
+    : cfg.serverUrl
+      ? `✗ not reachable (${cfg.serverUrl})`
+      : cfg.serverDiscovery
+        ? `✗ none found (probed ${DEFAULT_SERVER_CANDIDATES.join(", ")})`
+        : "— disabled";
   const root: PluginUIView["root"] = {
     type: "stack",
     children: [

@@ -4,15 +4,18 @@ The **local Whisper transcription backend** for [Shepherd](https://github.com/er
 compose-bar voice input (Shepherd issue #76). It records nothing itself — Shepherd's compose bar
 captures the audio in the browser and POSTs it here. Two backends, picked automatically:
 
-1. **faster-whisper HTTP server** (opt-in) — when you set `serverUrl` and that server is reachable,
-   the clip is forwarded to it (it decodes the audio and keeps the model warm, so **no local ffmpeg
-   or model file is needed**). Preferred over the CLI when available.
-2. **whisper.cpp CLI** (default) — the clip is converted with **ffmpeg** and transcribed by the
+1. **faster-whisper HTTP server** — **auto-discovered on `localhost`** (probes
+   `http://127.0.0.1:9876`, the `whisper-stt` server.py default). When one is found the clip is
+   forwarded to it (it decodes the audio and keeps the model warm, so **no local ffmpeg or model
+   file is needed**). Preferred over the CLI. Point `serverUrl` at a specific/remote server to skip
+   discovery, or set `serverDiscovery: false` to turn probing off.
+2. **whisper.cpp CLI** (fallback) — the clip is converted with **ffmpeg** and transcribed by the
    whisper.cpp CLI on the host.
 
-**Privacy:** with the default CLI backend, or a `serverUrl` on **`localhost`/`127.0.0.1`**, nothing
-leaves your machine. ⚠️ Pointing `serverUrl` at a **non-localhost** host sends the raw recorded audio
-off-box to that server — only do that if you trust it.
+**Privacy:** the CLI backend and localhost discovery keep everything on your machine — discovery only
+ever probes `localhost` and only trusts a service that passes the strict `/health` contract, so audio
+is never sent to an unrelated service. ⚠️ The **only** way audio leaves the box is an explicit
+`serverUrl` pointing at a **non-localhost** host — do that only if you trust that server.
 
 > **Server backend scope.** The `serverUrl` backend speaks one specific contract — `GET /health`
 > (`{"ready":true,"model":"…"}`) and `POST /transcribe` (multipart `file`, returns `{ "text": … }`),
@@ -31,8 +34,9 @@ off-box to that server — only do that if you trust it.
 
 ## Prerequisites
 
-**Server backend:** just a running faster-whisper server and `"serverUrl"` pointing at it — no
-ffmpeg, model, or CLI needed on the herdr host. Skip the three items below if you use it.
+**Server backend:** just a running faster-whisper server on the herdr host — it is
+**auto-discovered on `localhost:9876`** (or point `serverUrl` at another one). No ffmpeg, model, or
+CLI needed on the herdr host. Skip the three items below if you use it.
 
 **CLI backend** — three things on the host that runs herdr:
 
@@ -79,7 +83,8 @@ compose-bar mic uses it (see `preferLocal` for the browser-vs-local choice).
 
 | Field         | Default   | Meaning                                                                                     |
 | ------------- | --------- | ------------------------------------------------------------------------------------------- |
-| `serverUrl`   | `""` (off) | Base URL of a faster-whisper server (`/health` + `/transcribe` contract). Set it to enable + prefer the server backend (`""`/absent = disabled, no probing). Non-localhost sends audio off-host. |
+| `serverDiscovery` | `true` | Auto-discover a faster-whisper server on `localhost` (`127.0.0.1:9876`) when `serverUrl` is unset. `false` disables all probing. Localhost-only — never sends audio off-host. |
+| `serverUrl`   | `""` (discover) | Explicit base URL of a faster-whisper server (`/health` + `/transcribe` contract). Set it to probe **only** that URL and skip discovery; this is the only way to use a **non-localhost** server (which sends audio off-host). |
 | `binaryPath`  | auto      | Absolute path to the whisper.cpp CLI. Auto-detects `whisper-cli` → `whisper-cpp` on `PATH`. |
 | `model`       | auto      | Absolute path to a GGML model. Auto-scans `~/.shepherd/whisper/` for `ggml-<size>.bin`.     |
 | `modelSize`   | `"small"` | Which size to prefer when scanning + which the missing-model hint suggests.                 |

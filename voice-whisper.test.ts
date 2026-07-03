@@ -8,6 +8,7 @@ import {
   detect,
   readConfig,
   acceptHealth,
+  DEFAULT_SERVER_CANDIDATES,
   runTranscription,
   runServerTranscription,
   transcribeClip,
@@ -27,6 +28,7 @@ function cfg(over: Partial<ResolvedConfig> = {}): ResolvedConfig {
     modelSize: "small",
     ffmpegPath: null,
     serverUrl: null,
+    serverDiscovery: false,
     language: "auto",
     preferLocal: false,
     maxBytes: 25 * 1024 * 1024,
@@ -213,11 +215,17 @@ test("runTranscription: ffmpeg failure throws AND still cleans up temp files", a
 
 // ── faster-whisper server backend ────────────────────────────────────────────────────
 
-test("readConfig serverUrl: non-empty enables (trailing slash stripped), absent/empty disables", () => {
+test("readConfig serverUrl: non-empty sets explicit URL (trailing slash stripped); absent/empty → null", () => {
   expect(readConfig({}).serverUrl).toBe(null);
   expect(readConfig({ serverUrl: "" }).serverUrl).toBe(null);
   expect(readConfig({ serverUrl: "http://127.0.0.1:9876/" }).serverUrl).toBe("http://127.0.0.1:9876");
   expect(readConfig({ serverUrl: "http://127.0.0.1:9876" }).serverUrl).toBe("http://127.0.0.1:9876");
+});
+
+test("readConfig serverDiscovery defaults on, only false turns it off", () => {
+  expect(readConfig({}).serverDiscovery).toBe(true);
+  expect(readConfig({ serverDiscovery: true }).serverDiscovery).toBe(true);
+  expect(readConfig({ serverDiscovery: false }).serverDiscovery).toBe(false);
 });
 
 test("acceptHealth trusts only ready:true + a plausible non-empty model", () => {
@@ -229,7 +237,7 @@ test("acceptHealth trusts only ready:true + a plausible non-empty model", () => 
   expect(acceptHealth(null)).toBe(null);
 });
 
-test("detect prefers the server over a ready CLI, and only probes when serverUrl is set", async () => {
+test("detect: an explicit serverUrl is the only URL probed and wins over a ready CLI", async () => {
   const probed: string[] = [];
   const readyCli = detectDeps({
     which: (c) => (c === "ffmpeg" ? "/ff" : c === "whisper-cli" ? "/wc" : null),
@@ -239,18 +247,44 @@ test("detect prefers the server over a ready CLI, and only probes when serverUrl
       return { model: "medium" };
     },
   });
+  const d = await detect(cfg({ serverUrl: "http://s:9876" }), readyCli);
+  expect(probed).toEqual(["http://s:9876"]); // NOT the discovery candidates
+  expect(d.engine).toBe("server");
+  expect(d.server).toEqual({ url: "http://s:9876", model: "medium" });
+  expect(d.hint).toBe("");
+});
 
-  // serverUrl unset → never probes, falls to the CLI
-  const cliOnly = await detect(cfg(), readyCli);
+test("detect: discovery probes the localhost candidates and adopts a healthy one", async () => {
+  const probed: string[] = [];
+  const d = await detect(
+    cfg({ serverDiscovery: true }), // no serverUrl → discover
+    detectDeps({
+      probeServer: async (url) => {
+        probed.push(url);
+        return { model: "medium" };
+      },
+    }),
+  );
+  expect(probed).toEqual(DEFAULT_SERVER_CANDIDATES);
+  expect(d.engine).toBe("server");
+  expect(d.server).toEqual({ url: DEFAULT_SERVER_CANDIDATES[0]!, model: "medium" });
+});
+
+test("detect: discovery disabled (and no serverUrl) never probes → CLI", async () => {
+  const probed: string[] = [];
+  const d = await detect(
+    cfg({ serverDiscovery: false }),
+    detectDeps({
+      which: (c) => (c === "ffmpeg" ? "/ff" : c === "whisper-cli" ? "/wc" : null),
+      listDir: async () => ["ggml-small.bin"],
+      probeServer: async (url) => {
+        probed.push(url);
+        return { model: "medium" };
+      },
+    }),
+  );
   expect(probed).toEqual([]);
-  expect(cliOnly.engine).toBe("whisper.cpp");
-
-  // serverUrl set + reachable → server wins even though the CLI is also ready
-  const withServer = await detect(cfg({ serverUrl: "http://s:9876" }), readyCli);
-  expect(probed).toEqual(["http://s:9876"]);
-  expect(withServer.engine).toBe("server");
-  expect(withServer.server).toEqual({ url: "http://s:9876", model: "medium" });
-  expect(withServer.hint).toBe("");
+  expect(d.engine).toBe("whisper.cpp");
 });
 
 test("detect falls back to the CLI when the server is unreachable/rejected", async () => {
