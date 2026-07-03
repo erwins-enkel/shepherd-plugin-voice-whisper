@@ -1,0 +1,16 @@
+{
+  "name": "shepherd-plugin-voice-whisper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Whisper transcription backend for Shepherd's voice input (Shepherd issue #76).",
+  "main": "index.ts",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^6.0.2"
+  }
+}

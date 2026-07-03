@@ -1,0 +1,95 @@
+# shepherd-plugin-voice-whisper
+
+The **local Whisper transcription backend** for [Shepherd](https://github.com/erwins-enkel/shepherd)'s
+compose-bar voice input (Shepherd issue #76). It records nothing itself — Shepherd's compose bar
+captures the audio in the browser and POSTs it here; this plugin converts the clip with **ffmpeg**
+and transcribes it with the **whisper.cpp** CLI, entirely on the host. Nothing leaves your machine.
+
+> **Why the feature spans two repos.** Shepherd's plugin system is server-side and in-process — a
+> plugin can't run browser JS (`getUserMedia` / `MediaRecorder`) or add a button to the compose bar.
+> So audio **capture** lives in Shepherd's core UI (which calls `/api/plugins/voice-whisper/transcribe`),
+> and this repo is the **transcription engine**. On an iOS home-screen PWA — where the browser's Web
+> Speech API is unavailable — this is the **only** way to get a mic at all.
+>
+> Requires a Shepherd build that includes the compose-bar voice hook (Shepherd #76). Without it the
+> routes still work, but nothing calls them.
+
+## Prerequisites
+
+Three things on the host that runs herdr:
+
+1. **ffmpeg** on `PATH` — `brew install ffmpeg` / `apt install ffmpeg` / `pacman -S ffmpeg`.
+2. **whisper.cpp CLI** on `PATH` — `brew install whisper-cpp` (Homebrew names the binary
+   `whisper-cpp`), or build from source (the binary is `whisper-cli` since v1.7.4). You can also
+   point `binaryPath` at it in `config.json`.
+3. **A GGML model** — Homebrew installs the binary but **no model**, so this is the step people
+   miss. Drop one into **`~/.shepherd/whisper/`**:
+
+   ```sh
+   mkdir -p ~/.shepherd/whisper
+   curl -L -o ~/.shepherd/whisper/ggml-small.bin \
+     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
+   ```
+
+   `small` (~466 MB) is a good default; `base` (~142 MB) is faster/rougher, `large-v3-turbo`
+   (~1.6 GB) is best on Apple Silicon. Use the **multilingual** models (no `.en` suffix). Or set
+   `model` in `config.json` to a model you already have.
+
+The **Settings → Plugins** panel shows exactly which of the three are detected, and the status
+row / `GET status` route carry a copy-paste hint for whatever is missing.
+
+## Install
+
+Shepherd loads plugins from `~/.shepherd/plugins/` **at boot only** — clone here, then restart:
+
+```sh
+git clone https://github.com/erwins-enkel/shepherd-plugin-voice-whisper \
+  ~/.shepherd/plugins/voice-whisper
+# edit ~/.shepherd/plugins/voice-whisper/config.json if whisper-cli isn't on PATH
+systemctl --user restart shepherd
+```
+
+`git pull` in that folder + a restart updates it. When the plugin reports `available`, Shepherd's
+compose-bar mic uses it (see `preferLocal` for the browser-vs-local choice).
+
+## Config (`config.json`, all optional)
+
+| Field         | Default   | Meaning                                                                                     |
+| ------------- | --------- | ------------------------------------------------------------------------------------------- |
+| `binaryPath`  | auto      | Absolute path to the whisper.cpp CLI. Auto-detects `whisper-cli` → `whisper-cpp` on `PATH`. |
+| `model`       | auto      | Absolute path to a GGML model. Auto-scans `~/.shepherd/whisper/` for `ggml-<size>.bin`.     |
+| `modelSize`   | `"small"` | Which size to prefer when scanning + which the missing-model hint suggests.                 |
+| `ffmpegPath`  | auto      | Absolute path to ffmpeg. Auto-detects on `PATH`.                                            |
+| `language`    | `"auto"`  | `"de"`/`"en"` pin the language; `"auto"` defers to the request's UI locale.                 |
+| `preferLocal` | `false`   | `true` → use local whisper even where the browser's Web Speech API works; `false` keeps the browser engine as the default and only uses local where the browser has none (iOS PWA). |
+| `maxBytes`    | 25 MiB    | Reject larger clips with `413`.                                                             |
+
+## Routes (behind Shepherd's operator auth)
+
+- `POST /api/plugins/voice-whisper/transcribe` — multipart `file` (audio blob) + optional
+  `lang` form field → `{ text }`. `413` over `maxBytes`; `503` `{ error, hint }` if ffmpeg /
+  whisper.cpp / model is missing.
+- `GET /api/plugins/voice-whisper/status` → `{ available, engine, model, ffmpeg, language,
+  preferLocal, hint }`.
+
+## Pipeline
+
+`clip → temp file → ffmpeg -ar 16000 -ac 1 -c:a pcm_s16le → temp WAV → whisper-cli -m <model>
+-f <wav> -l <lang> -nt → text`. The clip is buffered to a **seekable temp file** before ffmpeg
+(never `-i pipe:0`) because iOS `MediaRecorder` mp4 carries a trailing `moov` atom that fails to
+demux from a non-seekable pipe. Both temp files are always cleaned up.
+
+## Develop / test
+
+```sh
+bun test                        # unit tests (mocked runner/IO; no real binaries)
+bun run typecheck               # tsc against the vendored contract
+
+# end-to-end smoke test against your real ffmpeg + whisper.cpp + model (no herdr, no browser):
+WHISPER_BIN=~/whisper.cpp/build/bin/whisper-cli \
+WHISPER_MODEL=~/whisper.cpp/models/ggml-small.bin \
+bun run smoke.ts /path/to/clip.wav de
+```
+
+`types.ts` is vendored from Shepherd's `src/plugins/types.ts` (plugin API v1). If Shepherd bumps
+the plugin API, refresh it and bump `apiVersion` in `plugin.json`.

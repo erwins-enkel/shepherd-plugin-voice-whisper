@@ -1,0 +1,413 @@
+// voice-whisper — the server-side transcription backend for Shepherd's local-Whisper
+// voice input (Shepherd issue #76). Install by cloning this repo into ~/.shepherd/plugins/
+// (the only dir Shepherd's loader scans) and restarting Shepherd.
+//
+// What it does: exposes two operator-auth'd HTTP routes under /api/plugins/voice-whisper/
+//   • POST transcribe — accepts a recorded audio clip (multipart `file`, optional `lang`),
+//     converts it to 16 kHz mono WAV with ffmpeg, runs it through the whisper.cpp CLI, and
+//     returns { text }. Shepherd's core compose-bar mic calls this.
+//   • GET  status    — detection result { available, engine, model, ffmpeg, … } the core UI
+//     reads (memoized) to decide whether to offer/prefer the local mic.
+// It also publishes the detection state to the Settings → Plugins panel.
+//
+// Why the feature is split across two repos: Shepherd's plugin system is server-side and
+// in-process — a plugin cannot run browser JS (getUserMedia / MediaRecorder) or add a
+// button to the compose bar. So audio CAPTURE lives in Shepherd's core UI (ComposeBar.svelte,
+// which POSTs to this route) and this repo is only the transcription engine.
+//
+// Types: `types.ts` is vendored from Shepherd's src/plugins/types.ts (the public plugin
+// contract, apiVersion 1) so this repo type-checks standalone. The `import type` line is
+// erased at runtime, so loading never depends on it.
+import type { PluginContext, PluginUIView } from "./types";
+import { mkdtemp, writeFile, rm, access, readdir } from "node:fs/promises";
+import { tmpdir, homedir } from "node:os";
+import { join } from "node:path";
+
+// ── config (config.json) ─────────────────────────────────────────────────────────────
+
+/** Shape of this plugin's own config.json (all fields optional — sensible defaults). */
+interface VoiceWhisperConfig {
+  /** Absolute path to the whisper.cpp CLI. Default: auto-detect whisper-cli / whisper-cpp on PATH. */
+  binaryPath?: string;
+  /** Absolute path to a GGML model file. Default: scan ~/.shepherd/whisper/ for ggml-<size>.bin. */
+  model?: string;
+  /** Preferred model size when scanning ~/.shepherd/whisper/ (e.g. "small", "base"). Default "small". */
+  modelSize?: string;
+  /** Absolute path to ffmpeg. Default: auto-detect on PATH. */
+  ffmpegPath?: string;
+  /** Pin transcription language. "de"/"en" force it; "auto" defers to the request's UI locale. Default "auto". */
+  language?: "auto" | "de" | "en";
+  /** When true, the core mic prefers local whisper even where the browser's Web Speech API works. Default false. */
+  preferLocal?: boolean;
+  /** Reject clips larger than this many bytes (413). Default 25 MiB. */
+  maxBytes?: number;
+}
+
+export interface ResolvedConfig {
+  binaryPath: string | null;
+  model: string | null;
+  modelSize: string;
+  ffmpegPath: string | null;
+  language: "auto" | "de" | "en";
+  preferLocal: boolean;
+  maxBytes: number;
+}
+
+const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
+const RUN_TIMEOUT_MS = 120_000;
+
+function readConfig(raw: Record<string, unknown>): ResolvedConfig {
+  const c = raw as VoiceWhisperConfig;
+  const str = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+  const lang = c.language === "de" || c.language === "en" ? c.language : "auto";
+  return {
+    binaryPath: str(c.binaryPath),
+    model: str(c.model),
+    modelSize: str(c.modelSize) ?? "small",
+    ffmpegPath: str(c.ffmpegPath),
+    language: lang,
+    preferLocal: c.preferLocal === true,
+    maxBytes: typeof c.maxBytes === "number" && c.maxBytes > 0 ? c.maxBytes : DEFAULT_MAX_BYTES,
+  };
+}
+
+// ── pure helpers (exported for unit tests) ───────────────────────────────────────────
+
+/** Map a MediaRecorder MIME type to a file extension. Strips the `;codecs=…` suffix. */
+export function extForMime(mime: string): string {
+  const base = (mime || "").split(";")[0]?.trim().toLowerCase();
+  switch (base) {
+    case "audio/webm":
+      return "webm";
+    case "audio/ogg":
+      return "ogg";
+    case "audio/mp4":
+    case "audio/x-m4a":
+      return "mp4";
+    case "audio/mpeg":
+      return "mp3";
+    case "audio/wav":
+    case "audio/x-wav":
+      return "wav";
+    default:
+      return "webm";
+  }
+}
+
+/** ffmpeg argv: decode a seekable input FILE → 16 kHz mono 16-bit PCM WAV FILE. We buffer the
+ *  upload to a temp file first (never `-i pipe:0`) because iOS MediaRecorder mp4 carries a
+ *  trailing `moov` atom that commonly fails to demux from a non-seekable pipe. */
+export function resolveFfmpegArgs(ffmpeg: string, input: string, wav: string): string[] {
+  // prettier-ignore
+  return [
+    ffmpeg, "-hide_banner", "-loglevel", "error",
+    "-i", input,
+    "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+    "-f", "wav", "-y", wav,
+  ];
+}
+
+/** whisper.cpp CLI argv. Reads audio from a FILE path (`-f`), not stdin. `-nt` drops
+ *  timestamps so stdout is plain text; `-l <lang>` pins the language when known. */
+export function resolveWhisperArgs(
+  binary: string,
+  model: string,
+  wav: string,
+  lang: string | null,
+): string[] {
+  const args = [binary, "-m", model, "-f", wav, "-nt"];
+  if (lang) args.push("-l", lang);
+  return args;
+}
+
+/** Collapse whisper.cpp stdout (one text line per segment under `-nt`) into a single string. */
+export function parseTranscript(stdout: string): string {
+  return stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+}
+
+/** Resolve the effective language to pin: config override wins; else the request's UI locale
+ *  when it is a supported code; else null (let whisper autodetect). */
+export function resolveLang(cfg: ResolvedConfig, requested: string | null): string | null {
+  if (cfg.language === "de" || cfg.language === "en") return cfg.language;
+  return requested === "de" || requested === "en" ? requested : null;
+}
+
+// ── detection ─────────────────────────────────────────────────────────────────────────
+
+export interface DetectDeps {
+  which: (cmd: string) => string | null;
+  exists: (path: string) => Promise<boolean>;
+  /** Basenames in `dir`, or [] when the dir is missing. */
+  listDir: (dir: string) => Promise<string[]>;
+  home: () => string;
+}
+
+export interface Detection {
+  ffmpeg: string | null;
+  binary: string | null;
+  model: string | null;
+  /** Actionable, copy-paste guidance for whatever is missing (empty when ready). */
+  hint: string;
+}
+
+async function resolveBinary(cfg: ResolvedConfig, d: DetectDeps): Promise<string | null> {
+  if (cfg.binaryPath) return (await d.exists(cfg.binaryPath)) ? cfg.binaryPath : null;
+  return d.which("whisper-cli") ?? d.which("whisper-cpp");
+}
+
+async function resolveModel(cfg: ResolvedConfig, d: DetectDeps): Promise<string | null> {
+  if (cfg.model) return (await d.exists(cfg.model)) ? cfg.model : null;
+  const dir = join(d.home(), ".shepherd", "whisper");
+  const files = (await d.listDir(dir)).filter((f) => f.endsWith(".bin"));
+  if (files.length === 0) return null;
+  const preferred = `ggml-${cfg.modelSize}.bin`;
+  const pick =
+    files.find((f) => f === preferred) ?? files.find((f) => f.startsWith("ggml-")) ?? files[0]!;
+  return join(dir, pick);
+}
+
+export async function detect(cfg: ResolvedConfig, d: DetectDeps): Promise<Detection> {
+  const ffmpeg =
+    cfg.ffmpegPath && (await d.exists(cfg.ffmpegPath)) ? cfg.ffmpegPath : d.which("ffmpeg");
+  const binary = await resolveBinary(cfg, d);
+  const model = await resolveModel(cfg, d);
+
+  const missing: string[] = [];
+  if (!ffmpeg) missing.push("Install ffmpeg (e.g. `brew install ffmpeg` or `apt install ffmpeg`).");
+  if (!binary)
+    missing.push(
+      "Install whisper.cpp (e.g. `brew install whisper-cpp`) or set `binaryPath` in config.json.",
+    );
+  if (!model) {
+    const home = join(d.home(), ".shepherd", "whisper");
+    missing.push(
+      `Download a GGML model into ${home}/, e.g.: mkdir -p ${home} && curl -L -o ${home}/ggml-${cfg.modelSize}.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${cfg.modelSize}.bin`,
+    );
+  }
+  return { ffmpeg: ffmpeg ?? null, binary, model, hint: missing.join(" · ") };
+}
+
+// ── transcription (injectable runner + IO for tests) ─────────────────────────────────
+
+export interface CmdResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+export type CmdRunner = (cmd: string[], timeoutMs: number) => Promise<CmdResult>;
+
+export interface TranscribeIO {
+  /** Write bytes to a fresh seekable temp file with the given extension; return its path. */
+  writeTemp: (bytes: Uint8Array, ext: string) => Promise<string>;
+  /** Sibling `.wav` path for a written input file. */
+  wavPathFor: (input: string) => string;
+  /** Best-effort delete. */
+  remove: (path: string) => Promise<void>;
+}
+
+/** ffmpeg → whisper.cpp over temp files, always cleaning both up. Throws on a non-zero exit. */
+export async function runTranscription(opts: {
+  bytes: Uint8Array;
+  ext: string;
+  lang: string | null;
+  ffmpeg: string;
+  binary: string;
+  model: string;
+  run: CmdRunner;
+  io: TranscribeIO;
+  timeoutMs?: number;
+}): Promise<string> {
+  const timeoutMs = opts.timeoutMs ?? RUN_TIMEOUT_MS;
+  const input = await opts.io.writeTemp(opts.bytes, opts.ext);
+  const wav = opts.io.wavPathFor(input);
+  try {
+    const ff = await opts.run(resolveFfmpegArgs(opts.ffmpeg, input, wav), timeoutMs);
+    if (ff.exitCode !== 0)
+      throw new Error(`ffmpeg exited ${ff.exitCode}: ${ff.stderr.slice(0, 400)}`);
+    const wr = await opts.run(
+      resolveWhisperArgs(opts.binary, opts.model, wav, opts.lang),
+      timeoutMs,
+    );
+    if (wr.exitCode !== 0)
+      throw new Error(`whisper exited ${wr.exitCode}: ${wr.stderr.slice(0, 400)}`);
+    return parseTranscript(wr.stdout);
+  } finally {
+    await opts.io.remove(input).catch(() => {});
+    await opts.io.remove(wav).catch(() => {});
+  }
+}
+
+// ── real runtime adapters ────────────────────────────────────────────────────────────
+
+const realDetectDeps: DetectDeps = {
+  which: (cmd) => Bun.which(cmd),
+  exists: async (p) => {
+    try {
+      await access(p);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  listDir: async (dir) => {
+    try {
+      return await readdir(dir);
+    } catch {
+      return [];
+    }
+  },
+  home: () => homedir(),
+};
+
+const realRun: CmdRunner = async (cmd, timeoutMs) => {
+  const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+  const timer = setTimeout(() => {
+    try {
+      proc.kill();
+    } catch {
+      /* already gone */
+    }
+  }, timeoutMs);
+  try {
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const exitCode = await proc.exited;
+    return { exitCode: exitCode ?? 1, stdout, stderr };
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const realIO: TranscribeIO = {
+  writeTemp: async (bytes, ext) => {
+    const dir = await mkdtemp(join(tmpdir(), "shepherd-voice-"));
+    const p = join(dir, `clip.${ext}`);
+    await writeFile(p, bytes);
+    return p;
+  },
+  wavPathFor: (input) => input.replace(/\.[^./]+$/, "") + ".wav",
+  remove: async (p) => {
+    // remove the file's parent temp dir (created per-clip by writeTemp) so nothing lingers
+    await rm(join(p, ".."), { recursive: true, force: true });
+  },
+};
+
+// ── plugin entry ─────────────────────────────────────────────────────────────────────
+
+function statusBody(cfg: ResolvedConfig, d: Detection) {
+  return {
+    available: !!(d.ffmpeg && d.binary && d.model),
+    engine: d.binary ? "whisper.cpp" : null,
+    binary: d.binary,
+    model: d.model,
+    ffmpeg: !!d.ffmpeg,
+    language: cfg.language,
+    preferLocal: cfg.preferLocal,
+    hint: d.hint,
+  };
+}
+
+function panelView(cfg: ResolvedConfig, d: Detection): PluginUIView {
+  const available = !!(d.ffmpeg && d.binary && d.model);
+  const root: PluginUIView["root"] = {
+    type: "stack",
+    children: [
+      {
+        type: "key-value",
+        props: {
+          pairs: [
+            { key: "ffmpeg", value: d.ffmpeg ? `✓ ${d.ffmpeg}` : "✗ not found" },
+            { key: "whisper.cpp", value: d.binary ? `✓ ${d.binary}` : "✗ not found" },
+            { key: "model", value: d.model ? `✓ ${d.model}` : "✗ not found" },
+            { key: "language", value: cfg.language },
+            { key: "prefer local", value: cfg.preferLocal ? "yes" : "no (browser first)" },
+            { key: "status", value: available ? "ready" : "not ready" },
+          ],
+        },
+      },
+      ...(available ? [] : [{ type: "callout", props: { tone: "warn", text: d.hint } } as const]),
+    ],
+  };
+  return { schemaVersion: 1, slot: "settings-panel", title: "Local Whisper voice input", root };
+}
+
+export async function register(ctx: PluginContext): Promise<() => void> {
+  const cfg = readConfig(ctx.config);
+  ctx.log.log(
+    `registering — language=${cfg.language} preferLocal=${cfg.preferLocal} modelSize=${cfg.modelSize}`,
+  );
+
+  const refreshPanel = async (): Promise<Detection> => {
+    const d = await detect(cfg, realDetectDeps);
+    ctx.publishStatus(statusBody(cfg, d));
+    if (typeof ctx.publishUI === "function") ctx.publishUI(panelView(cfg, d));
+    return d;
+  };
+
+  // GET status — the core UI memoizes this to decide whether to show/prefer the local mic.
+  ctx.route("GET", "status", async () => {
+    const d = await detect(cfg, realDetectDeps);
+    return Response.json(statusBody(cfg, d));
+  });
+
+  // POST transcribe — multipart `file` (+ optional `lang`) → { text }. Re-detects each call so
+  // dropping a model in after boot works without a restart.
+  ctx.route("POST", "transcribe", async (req) => {
+    // Reject oversized clips BEFORE ingesting the body: check Content-Length first so a huge
+    // upload is refused without buffering it (Bun.serve's default body limit won't protect us).
+    const declared = Number(req.headers.get("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > cfg.maxBytes)
+      return Response.json({ error: "clip too large" }, { status: 413 });
+
+    const form = await req.formData().catch(() => null);
+    const file = form?.get("file");
+    if (!(file instanceof File))
+      return Response.json({ error: "missing file field" }, { status: 400 });
+    // Authoritative cap on the actual received bytes (Content-Length may be absent/wrong).
+    if (file.size > cfg.maxBytes)
+      return Response.json({ error: "clip too large" }, { status: 413 });
+
+    const d = await detect(cfg, realDetectDeps);
+    if (!d.ffmpeg || !d.binary || !d.model)
+      return Response.json({ error: "voice engine not ready", hint: d.hint }, { status: 503 });
+
+    const langField = form?.get("lang");
+    const lang = resolveLang(cfg, typeof langField === "string" ? langField : null);
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const text = await runTranscription({
+        bytes,
+        ext: extForMime(file.type),
+        lang,
+        ffmpeg: d.ffmpeg,
+        binary: d.binary,
+        model: d.model,
+        run: realRun,
+        io: realIO,
+      });
+      return Response.json({ text });
+    } catch (e) {
+      ctx.log.warn(`transcribe failed: ${e instanceof Error ? e.message : String(e)}`);
+      return Response.json({ error: "transcription failed" }, { status: 500 });
+    }
+  });
+
+  await refreshPanel();
+
+  if (typeof ctx.publishGearItem === "function") {
+    ctx.publishGearItem({
+      label: "Voice input (Whisper)",
+      icon: "🎙️",
+      action: { kind: "panel" },
+    });
+  }
+
+  return () => ctx.log.log("torn down");
+}
