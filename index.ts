@@ -404,7 +404,11 @@ export async function runServerTranscription(opts: {
 
 /** Run the clip through whatever engine `detect()` selected, with a post-time safety net: if the
  *  server was ready at detect() but has since gone away, fall back to the whisper.cpp CLI when it is
- *  ready; otherwise throw {@link ServerUnavailable} (→ 503), never an unhandled 500. */
+ *  ready; otherwise throw {@link ServerUnavailable} (→ 503), never an unhandled 500.
+ *
+ *  `onBackend` (optional) fires with the backend that ACTUALLY produced the text — which is not
+ *  necessarily `detection.engine`, since a dead server degrades to the CLI. The self-test uses this so
+ *  it never claims "via server" when whisper.cpp did the work. */
 export async function transcribeClip(opts: {
   detection: Detection;
   bytes: Uint8Array;
@@ -414,13 +418,14 @@ export async function transcribeClip(opts: {
   io: TranscribeIO;
   post: ServerPoster;
   timeoutMs?: number;
+  onBackend?: (engine: Engine) => void;
 }): Promise<string> {
   const d = opts.detection;
   const cliReady = !!(d.ffmpeg && d.binary && d.model);
 
   if (d.engine === "server" && d.server) {
     try {
-      return await runServerTranscription({
+      const text = await runServerTranscription({
         url: d.server.url,
         bytes: opts.bytes,
         ext: opts.ext,
@@ -428,6 +433,8 @@ export async function transcribeClip(opts: {
         post: opts.post,
         timeoutMs: opts.timeoutMs,
       });
+      opts.onBackend?.("server");
+      return text;
     } catch (e) {
       if (!cliReady)
         throw new ServerUnavailable(
@@ -438,6 +445,7 @@ export async function transcribeClip(opts: {
   }
 
   if (!cliReady) throw new ServerUnavailable("no transcription engine available");
+  opts.onBackend?.("whisper.cpp");
   return runTranscription({
     bytes: opts.bytes,
     ext: opts.ext,
@@ -465,6 +473,8 @@ const SELFTEST_LANG = "en";
 export interface SelfTestResult {
   /** True only when the engine returned a non-empty transcript. */
   ok: boolean;
+  /** The backend that ACTUALLY produced the text — not necessarily the one `detect()` selected, since
+   *  a server that died since detection degrades to the CLI. null when the run errored before any ran. */
   engine: Engine | null;
   /** The transcript (trimmed; "" when the engine returned nothing or the run errored). */
   text: string;
@@ -486,7 +496,9 @@ export async function runSelfTest(opts: {
   post: ServerPoster;
   timeoutMs?: number;
 }): Promise<SelfTestResult> {
-  const engine = opts.detection.engine;
+  // Report the backend that actually ran, not the one detect() picked — transcribeClip may degrade a
+  // dead server to the CLI, and claiming "via server" then would be a lie.
+  let engine = opts.detection.engine;
   const t0 = performance.now();
   try {
     const text = (
@@ -499,6 +511,9 @@ export async function runSelfTest(opts: {
         io: opts.io,
         post: opts.post,
         timeoutMs: opts.timeoutMs,
+        onBackend: (e) => {
+          engine = e;
+        },
       })
     ).trim();
     return { ok: text.length > 0, engine, text, ms: Math.round(performance.now() - t0) };

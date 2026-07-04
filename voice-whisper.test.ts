@@ -493,6 +493,30 @@ test("runSelfTest: CLI path transcribes the bundled clip as wav pinned to en", a
   expect(whisperCall[whisperCall.indexOf("-l") + 1]).toBe("en");
 });
 
+test("runSelfTest: server dead at POST but CLI ready → reports the ACTUAL backend (whisper.cpp)", async () => {
+  // detect() picked the server, but it's unreachable now and a CLI is ready → transcribeClip degrades.
+  // The result must NOT claim "server" — it must report the backend that actually produced the text.
+  const post: ServerPoster = async () => {
+    throw new Error("connection refused");
+  };
+  const h = harness((cmd) =>
+    cmd[0] === "/ff"
+      ? { exitCode: 0, stdout: "", stderr: "" }
+      : { exitCode: 0, stdout: "and so my fellow americans\n", stderr: "" },
+  );
+  const r = await runSelfTest({
+    detection: serverDetection({ ffmpeg: "/ff", binary: "/wc", model: "/m.bin" }),
+    bytes: new Uint8Array([1, 2, 3]),
+    run: h.run,
+    io: h.io,
+    post,
+  });
+  expect(r.ok).toBe(true);
+  expect(r.engine).toBe("whisper.cpp"); // the truth, not the selected "server"
+  expect(formatSelfTestResult(r)).toContain("whisper.cpp");
+  expect(formatSelfTestResult(r)).not.toContain("faster-whisper server");
+});
+
 test("runSelfTest: empty transcript is a handled failure (ok:false, no error)", async () => {
   const post: ServerPoster = async () => ({ status: 200, body: { text: "   " } });
   const h = harness(() => ({ exitCode: 0, stdout: "", stderr: "" }));
