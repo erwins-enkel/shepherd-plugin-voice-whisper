@@ -2,13 +2,17 @@
 // voice input (Shepherd issue #76). Install by cloning this repo into ~/.shepherd/plugins/
 // (the only dir Shepherd's loader scans) and restarting Shepherd.
 //
-// What it does: exposes two operator-auth'd HTTP routes under /api/plugins/voice-whisper/
+// What it does: exposes operator-auth'd HTTP routes under /api/plugins/voice-whisper/
 //   • POST transcribe — accepts a recorded audio clip (multipart `file`, optional `lang`) and
 //     returns { text }. Two backends: an opt-in faster-whisper HTTP server (config `serverUrl`,
 //     preferred when reachable), else the local whisper.cpp CLI (ffmpeg → 16 kHz mono WAV → CLI).
 //     Shepherd's core compose-bar mic calls this.
 //   • GET  status    — detection result { available, engine, model, ffmpeg, … } the core UI
 //     reads (memoized) to decide whether to offer/prefer the local mic.
+//   • POST selftest  — runs a bundled per-language test clip ({ lang: "de" | "en" }) through the
+//     live engine; backs the panel's and the test page's Test buttons.
+//   • GET  test      — a self-contained operator test page: live mic recorder + the canned
+//     self-tests + engine status. The gear-menu item opens it.
 // It also publishes the detection state to the Settings → Plugins panel.
 //
 // Why the feature is split across two repos: Shepherd's plugin system is server-side and
@@ -461,18 +465,36 @@ export async function transcribeClip(opts: {
 
 // ── self-test (operator "Test transcription" button) ────────────────────────────────
 
-/** The bundled self-test clip: a ~3s public-domain excerpt of JFK's 1961 inaugural address
- *  (from ggerganov/whisper.cpp `samples/jfk.wav` — a US federal-government recording, public domain).
- *  16 kHz mono 16-bit WAV. The Settings-panel Test button runs it through the SAME `transcribeClip`
- *  path the compose-bar mic uses, so a green result proves real end-to-end speech-to-text. */
-export const SELFTEST_CLIP_PATH = "assets/selftest-en.wav";
-/** The clip is English, so pin its language regardless of `config.language` — forcing another
- *  language would garble a perfectly healthy engine and mis-report it as broken. */
-const SELFTEST_LANG = "en";
+/** Language of a bundled self-test clip (and the `lang` the selftest route accepts). */
+export type SelfTestLang = "de" | "en";
+
+/** The bundled self-test clips, one per language — short synthetic sentences generated with
+ *  Piper TTS (github.com/OHF-Voice/piper1-gpl; voices: `de_DE-thorsten-medium` with
+ *  noise-scale 0.2 / length-scale 1.25, `en_US-lessac-medium`), 16 kHz mono 16-bit WAV:
+ *    de: "Schafe. Schafe. Ich sehe nur noch Schafe."
+ *    en: "Sheep. Sheep. All I see is sheep."
+ *  The Settings-panel Test buttons run them through the SAME `transcribeClip` path the
+ *  compose-bar mic uses, so a green result proves real end-to-end speech-to-text. Each clip's
+ *  language is pinned regardless of `config.language` — forcing another language would garble a
+ *  perfectly healthy engine and mis-report it as broken. */
+export const SELFTEST_CLIPS: Record<SelfTestLang, string> = {
+  de: "assets/selftest-de.wav",
+  en: "assets/selftest-en.wav",
+};
+
+/** Resolve a selftest request body to a clip language, TOLERANTLY: `{ lang: "de" }` picks the
+ *  German clip; anything else — missing/invalid/non-JSON body (passed here as null) or a `lang`
+ *  outside de/en — falls back to "en" instead of erroring, so the route never fails on body shape.
+ *  (The panel's action-buttons and the test page send `{ lang: "de" | "en" }` verbatim.) */
+export function resolveSelfTestLang(body: unknown): SelfTestLang {
+  return (body as { lang?: unknown } | null)?.lang === "de" ? "de" : "en";
+}
 
 export interface SelfTestResult {
   /** True only when the engine returned a non-empty transcript. */
   ok: boolean;
+  /** Which bundled clip ran (pinned as the transcription language). */
+  lang: SelfTestLang;
   /** The backend that ACTUALLY produced the text — not necessarily the one `detect()` selected, since
    *  a server that died since detection degrades to the CLI. null when the run errored before any ran. */
   engine: Engine | null;
@@ -491,6 +513,8 @@ export interface SelfTestResult {
 export async function runSelfTest(opts: {
   detection: Detection;
   bytes: Uint8Array;
+  /** Which bundled clip is running — pinned as the transcription language. */
+  lang: SelfTestLang;
   run: CmdRunner;
   io: TranscribeIO;
   post: ServerPoster;
@@ -506,7 +530,7 @@ export async function runSelfTest(opts: {
         detection: opts.detection,
         bytes: opts.bytes,
         ext: "wav",
-        lang: SELFTEST_LANG,
+        lang: opts.lang,
         run: opts.run,
         io: opts.io,
         post: opts.post,
@@ -516,10 +540,17 @@ export async function runSelfTest(opts: {
         },
       })
     ).trim();
-    return { ok: text.length > 0, engine, text, ms: Math.round(performance.now() - t0) };
+    return {
+      ok: text.length > 0,
+      lang: opts.lang,
+      engine,
+      text,
+      ms: Math.round(performance.now() - t0),
+    };
   } catch (e) {
     return {
       ok: false,
+      lang: opts.lang,
       engine,
       text: "",
       ms: Math.round(performance.now() - t0),
@@ -533,9 +564,9 @@ export async function runSelfTest(opts: {
  *  untruncated panel row is the durable signal. */
 export function formatSelfTestResult(r: SelfTestResult): string {
   const eng = engineLabel(r.engine) ?? "engine";
-  if (r.error) return `✗ Test failed via ${eng}: ${r.error} (${r.ms} ms)`;
-  if (!r.ok) return `✗ Test failed via ${eng}: engine returned no text (${r.ms} ms)`;
-  return `✓ Test OK · ${eng} — "${r.text}" (${r.ms} ms)`;
+  if (r.error) return `✗ Test failed (${r.lang}) via ${eng}: ${r.error} (${r.ms} ms)`;
+  if (!r.ok) return `✗ Test failed (${r.lang}) via ${eng}: engine returned no text (${r.ms} ms)`;
+  return `✓ Test OK · ${r.lang} · ${eng} — "${r.text}" (${r.ms} ms)`;
 }
 
 // ── real runtime adapters ────────────────────────────────────────────────────────────
@@ -660,12 +691,16 @@ function statusBody(cfg: ResolvedConfig, d: Detection) {
   };
 }
 
+/** Absolute path of the plugin-served test page (mic recorder + canned self-tests). Kept in one
+ *  place because it appears in the gear item, the panel row, and the README. */
+export const TEST_PAGE_PATH = "/api/plugins/voice-whisper/test";
+
 export function panelView(
   cfg: ResolvedConfig,
   d: Detection,
   lastTest: SelfTestResult | null,
-  /** Whether the bundled self-test clip loaded — the Test button is only offered when it did. */
-  testable: boolean,
+  /** Which bundled self-test clips loaded — each Test button is only offered when its clip did. */
+  testable: Record<SelfTestLang, boolean>,
 ): PluginUIView {
   const available = d.engine !== null;
   const serverRow = d.server
@@ -690,6 +725,8 @@ export function panelView(
             { key: "language", value: cfg.language },
             { key: "prefer local", value: cfg.preferLocal ? "yes" : "no (browser first)" },
             { key: "status", value: available ? "ready" : "not ready" },
+            // The mic test page (the panel can't render clickable links; the gear item opens it).
+            { key: "test page", value: TEST_PAGE_PATH },
             // The durable, untruncated test signal (the button's toast is neutral + truncated).
             ...(available
               ? [{ key: "last test", value: lastTest ? formatSelfTestResult(lastTest) : "never run" }]
@@ -697,25 +734,215 @@ export function panelView(
           ],
         },
       },
-      // Only offer the Test button when an engine is ready AND the bundled clip loaded — otherwise a
-      // click would only ever report failure. When not ready the callout below explains what's missing.
-      ...(available && testable
-        ? [
-            {
-              type: "action-button",
-              props: {
-                label: "Test transcription",
-                tone: "info",
-                route: { method: "POST", path: "selftest" },
-                body: {},
-              },
-            } as const,
-          ]
+      // Only offer a Test button when an engine is ready AND that language's bundled clip loaded —
+      // otherwise a click would only ever report failure. When not ready the callout below explains
+      // what's missing.
+      ...(available
+        ? ([
+            ["de", "Test (Deutsch)"],
+            ["en", "Test (English)"],
+          ] as const)
+            .filter(([lang]) => testable[lang])
+            .map(
+              ([lang, label]) =>
+                ({
+                  type: "action-button",
+                  props: {
+                    label,
+                    tone: "info",
+                    route: { method: "POST", path: "selftest" },
+                    body: { lang },
+                  },
+                }) as const,
+            )
         : []),
       ...(available ? [] : [{ type: "callout", props: { tone: "warn", text: d.hint } } as const]),
     ],
   };
   return { schemaVersion: 1, slot: "settings-panel", title: "Local Whisper voice input", root };
+}
+
+/** The operator test page served by `GET test` — one page reaching EVERY test: a live mic
+ *  recorder (getUserMedia + MediaRecorder → POST `transcribe`, the exact route the compose-bar
+ *  mic uses), the two canned self-test buttons (POST `selftest` with `{lang}`), and the engine
+ *  status (GET `status`). Fully self-contained (inline CSS/JS, no external resources) because
+ *  core sets no CSP but the page must never depend on third-party hosts. All fetches use
+ *  RELATIVE paths so they resolve inside this plugin's own `/api/plugins/voice-whisper/`
+ *  namespace and ride the operator's same-origin session cookie. getUserMedia additionally
+ *  needs a secure context (HTTPS/localhost) — the page explains that instead of failing mute;
+ *  the canned buttons work regardless of mic permission. */
+export function testPageHtml(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local Whisper — Test</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.3rem; } h2 { font-size: 1rem; margin-top: 2rem; }
+  button { font: inherit; padding: .5rem 1rem; border-radius: .5rem; border: 1px solid #8884; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  select { font: inherit; padding: .4rem; border-radius: .5rem; }
+  #rec.recording { background: #c0392b; color: #fff; }
+  .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin: .75rem 0; }
+  .out { border: 1px solid #8884; border-radius: .5rem; padding: .75rem; min-height: 2.5rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .muted { opacity: .7; font-size: .9rem; }
+  .err { color: #c0392b; }
+</style>
+</head>
+<body>
+<h1>🎙️ Local Whisper — Test</h1>
+<p class="muted" id="status">Checking engine …</p>
+
+<h2>Speak yourself</h2>
+<div class="row">
+  <button id="rec" disabled>🎙️ Start recording</button>
+  <label>Language
+    <select id="lang">
+      <option value="">auto</option>
+      <option value="de">de</option>
+      <option value="en">en</option>
+    </select>
+  </label>
+</div>
+<p class="muted" id="mic-state"></p>
+<div class="out" id="transcript"></div>
+<p class="muted" id="timing"></p>
+
+<h2>Canned self-tests</h2>
+<p class="muted">The bundled clips, through the same engine the mic uses.</p>
+<div class="row">
+  <button data-selftest="de">Test (Deutsch)</button>
+  <button data-selftest="en">Test (English)</button>
+</div>
+<div class="out" id="selftest-out"></div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+
+  // ── engine status ────────────────────────────────────────────────────────
+  fetch("status").then((r) => r.json()).then((s) => {
+    $("status").textContent = s.available
+      ? "Engine ready: " + s.engine + (s.model ? " (model " + s.model + ")" : "")
+      : "Engine not ready — " + (s.hint || "see the plugin panel");
+    if (!s.available) $("status").classList.add("err");
+  }).catch(() => { $("status").textContent = "Engine status unavailable."; });
+
+  // ── canned self-tests (same POST selftest route as the panel buttons) ───
+  for (const btn of document.querySelectorAll("[data-selftest]")) {
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      $("selftest-out").textContent = "⏳ running …";
+      try {
+        const res = await fetch("selftest", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lang: btn.dataset.selftest }),
+        });
+        $("selftest-out").textContent = await res.text();
+      } catch (e) {
+        $("selftest-out").textContent = "✗ request failed: " + e;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  // ── live mic recorder → POST transcribe (the compose-bar mic's route) ───
+  const rec = $("rec");
+  const canRecord =
+    window.isSecureContext &&
+    typeof MediaRecorder !== "undefined" &&
+    !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  if (!canRecord) {
+    $("mic-state").textContent = window.isSecureContext
+      ? "Recording unavailable: this browser lacks MediaRecorder/getUserMedia."
+      : "Recording needs a secure context — open this page via HTTPS (or localhost).";
+    $("mic-state").classList.add("err");
+  } else {
+    rec.disabled = false;
+  }
+
+  // Same container candidates as Shepherd's compose bar (webm first, mp4 for iOS).
+  function pickMimeType() {
+    for (const c of ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"])
+      if (MediaRecorder.isTypeSupported(c)) return c;
+    return undefined;
+  }
+
+  let recorder = null;
+  let chunks = [];
+
+  async function transcribe(blob) {
+    $("mic-state").textContent = "Transcribing …";
+    $("transcript").textContent = "";
+    $("timing").textContent = "";
+    const form = new FormData();
+    form.append("file", blob, "clip");
+    const lang = $("lang").value;
+    if (lang) form.append("lang", lang);
+    const t0 = performance.now();
+    try {
+      const res = await fetch("transcribe", { method: "POST", body: form });
+      const body = await res.json().catch(() => ({}));
+      const ms = Math.round(performance.now() - t0);
+      if (!res.ok) {
+        $("mic-state").textContent = "";
+        $("transcript").textContent =
+          "✗ " + (body.error || "HTTP " + res.status) + (body.hint ? " — " + body.hint : "");
+        $("transcript").classList.add("err");
+        return;
+      }
+      $("mic-state").textContent = "";
+      $("transcript").classList.remove("err");
+      $("transcript").textContent = body.text || "(empty transcript)";
+      $("timing").textContent = ms + " ms round-trip";
+    } catch (e) {
+      $("mic-state").textContent = "";
+      $("transcript").textContent = "✗ request failed: " + e;
+      $("transcript").classList.add("err");
+    }
+  }
+
+  rec.addEventListener("click", async () => {
+    if (recorder && recorder.state === "recording") {
+      recorder.stop();
+      return;
+    }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      $("mic-state").textContent = "✗ microphone permission denied: " + e;
+      $("mic-state").classList.add("err");
+      return;
+    }
+    chunks = [];
+    const mime = pickMimeType();
+    recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    recorder.addEventListener("dataavailable", (e) => { if (e.data.size) chunks.push(e.data); });
+    recorder.addEventListener("stop", () => {
+      stream.getTracks().forEach((t) => t.stop());
+      rec.textContent = "🎙️ Start recording";
+      rec.classList.remove("recording");
+      const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+      if (blob.size) transcribe(blob);
+      else $("mic-state").textContent = "Nothing recorded.";
+    });
+    recorder.start();
+    rec.textContent = "⏹ Stop";
+    rec.classList.add("recording");
+    $("mic-state").textContent = "Recording … speak now, then press Stop.";
+    $("mic-state").classList.remove("err");
+  });
+})();
+</script>
+</body>
+</html>
+`;
 }
 
 export async function register(ctx: PluginContext): Promise<() => void> {
@@ -730,16 +957,24 @@ export async function register(ctx: PluginContext): Promise<() => void> {
   // interim loop silently skips that tick and retries on the next one.
   const gate = makeGate(cfg.maxConcurrent);
 
-  // Load the bundled self-test clip once at boot. A broken install (asset missing) must not crash
-  // load — we just log and withhold the Test button (panelView's `testable` flag).
-  let selfTestClip: Uint8Array | null = null;
-  try {
-    selfTestClip = new Uint8Array(await readFile(join(import.meta.dir, SELFTEST_CLIP_PATH)));
-  } catch (e) {
-    ctx.log.warn(
-      `self-test clip missing (${SELFTEST_CLIP_PATH}) — Test button disabled: ${e instanceof Error ? e.message : String(e)}`,
-    );
+  // Load the bundled self-test clips once at boot. A broken install (asset missing) must not crash
+  // load — we just log and withhold that language's Test button (panelView's `testable` record).
+  const selfTestClips: Record<SelfTestLang, Uint8Array | null> = { de: null, en: null };
+  for (const lang of ["de", "en"] as const) {
+    try {
+      selfTestClips[lang] = new Uint8Array(
+        await readFile(join(import.meta.dir, SELFTEST_CLIPS[lang])),
+      );
+    } catch (e) {
+      ctx.log.warn(
+        `self-test clip missing (${SELFTEST_CLIPS[lang]}) — Test (${lang}) button disabled: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   }
+  const testable = (): Record<SelfTestLang, boolean> => ({
+    de: selfTestClips.de !== null,
+    en: selfTestClips.en !== null,
+  });
 
   // Most recent self-test outcome, surfaced in the panel's "last test" row. In-memory only: resets to
   // "never run" on restart (deliberately simple — the operator just re-runs the test).
@@ -749,7 +984,7 @@ export async function register(ctx: PluginContext): Promise<() => void> {
     const d = await detect(cfg, realDetectDeps);
     ctx.publishStatus(statusBody(cfg, d));
     if (typeof ctx.publishUI === "function")
-      ctx.publishUI(panelView(cfg, d, lastTest, selfTestClip !== null));
+      ctx.publishUI(panelView(cfg, d, lastTest, testable()));
     return d;
   };
 
@@ -810,21 +1045,27 @@ export async function register(ctx: PluginContext): Promise<() => void> {
     }
   });
 
-  // POST selftest — the Settings-panel "Test transcription" button. Runs the bundled clip through the
-  // live engine to prove real end-to-end STT. EVERY handled outcome returns HTTP 200 with a plain-text
-  // ✓/✗/⏳ body: core's action-button throws on any non-2xx and then shows a FIXED generic "failed"
-  // toast, discarding our crafted message — so we must answer 200 even for failures.
-  ctx.route("POST", "selftest", async () => {
+  // POST selftest — the panel's / test page's "Test (Deutsch)/(English)" buttons. Runs the bundled
+  // clip for the requested language through the live engine to prove real end-to-end STT. The JSON
+  // body `{ lang: "de" | "en" }` is parsed TOLERANTLY: a missing/invalid/non-JSON body (or a lang
+  // outside de/en) falls back to "en" instead of erroring, so the route never fails on body shape.
+  // EVERY handled outcome returns HTTP 200 with a plain-text ✓/✗/⏳ body: core's action-button
+  // throws on any non-2xx and then shows a FIXED generic "failed" toast, discarding our crafted
+  // message — so we must answer 200 even for failures.
+  ctx.route("POST", "selftest", async (req) => {
+    const lang = resolveSelfTestLang(await req.json().catch(() => null));
     const d = await detect(cfg, realDetectDeps);
     if (!d.engine) {
       if (typeof ctx.publishUI === "function")
-        ctx.publishUI(panelView(cfg, d, lastTest, selfTestClip !== null));
+        ctx.publishUI(panelView(cfg, d, lastTest, testable()));
       return new Response(`✗ engine not ready — ${d.hint}`, { status: 200 });
     }
-    if (!selfTestClip)
-      return new Response("✗ Test unavailable — the bundled test clip is missing from this install.", {
-        status: 200,
-      });
+    const clip = selfTestClips[lang];
+    if (!clip)
+      return new Response(
+        `✗ Test unavailable — the bundled ${lang} test clip is missing from this install.`,
+        { status: 200 },
+      );
     // Share the transcribe gate so a test never exceeds maxConcurrent alongside live dictation.
     if (!gate.tryEnter(0))
       return new Response("⏳ busy — an engine is transcribing, try again in a moment.", {
@@ -833,25 +1074,43 @@ export async function register(ctx: PluginContext): Promise<() => void> {
     try {
       lastTest = await runSelfTest({
         detection: d,
-        bytes: selfTestClip,
+        bytes: clip,
+        lang,
         run: realRun,
         io: realIO,
         post: realServerPost,
       });
-      if (typeof ctx.publishUI === "function") ctx.publishUI(panelView(cfg, d, lastTest, true));
+      if (typeof ctx.publishUI === "function")
+        ctx.publishUI(panelView(cfg, d, lastTest, testable()));
       return new Response(formatSelfTestResult(lastTest), { status: 200 });
     } finally {
       gate.leave();
     }
   });
 
+  // GET test — the operator test page: a self-contained HTML page (inline CSS/JS, no external
+  // resources) bundling EVERY test in one place: a live mic recorder posting to `transcribe`
+  // (the exact path the compose-bar mic uses), the two canned self-test buttons, and the engine
+  // status. Served under the plugin's operator-auth'd namespace, so an already-logged-in browser
+  // opens it directly; the explicit Content-Type makes it render inline (core passes plugin
+  // response headers through verbatim).
+  ctx.route("GET", "test", async () => {
+    return new Response(testPageHtml(), {
+      status: 200,
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
+  });
+
   await refreshPanel();
 
+  // One click reaches EVERY test: the page hosts the mic recorder AND the canned self-test
+  // buttons AND the engine status. The settings panel keeps its own buttons and stays reachable
+  // via Settings → Plugins (a plugin gets at most ONE gear item).
   if (typeof ctx.publishGearItem === "function") {
     ctx.publishGearItem({
-      label: "Voice input (Whisper)",
+      label: "Voice input (Whisper) — test",
       icon: "🎙️",
-      action: { kind: "panel" },
+      action: { kind: "url", href: TEST_PAGE_PATH },
     });
   }
 

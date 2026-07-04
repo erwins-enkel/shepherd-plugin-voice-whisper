@@ -16,7 +16,10 @@ import {
   makeGate,
   runSelfTest,
   formatSelfTestResult,
+  resolveSelfTestLang,
   panelView,
+  testPageHtml,
+  TEST_PAGE_PATH,
   type ResolvedConfig,
   type Detection,
   type DetectDeps,
@@ -455,12 +458,14 @@ test("runSelfTest: server path returns ok with the transcript, engine and timing
   const r = await runSelfTest({
     detection: serverDetection(),
     bytes: new Uint8Array([1, 2, 3]),
+    lang: "en",
     run: h.run,
     io: h.io,
     post,
   });
   expect(r.ok).toBe(true);
   expect(r.engine).toBe("server");
+  expect(r.lang).toBe("en");
   expect(r.text).toBe("And so, my fellow Americans."); // trimmed
   expect(r.error).toBeUndefined();
   expect(typeof r.ms).toBe("number");
@@ -468,11 +473,11 @@ test("runSelfTest: server path returns ok with the transcript, engine and timing
   expect(h.calls.length).toBe(0); // server path never touches the CLI
 });
 
-test("runSelfTest: CLI path transcribes the bundled clip as wav pinned to en", async () => {
+test("runSelfTest: CLI path transcribes the bundled clip as wav pinned to its language", async () => {
   const h = harness((cmd) =>
     cmd[0] === "/ff"
       ? { exitCode: 0, stdout: "", stderr: "" }
-      : { exitCode: 0, stdout: "and so my fellow americans\n", stderr: "" },
+      : { exitCode: 0, stdout: "Sheep. Sheep. All I see is sheep.\n", stderr: "" },
   );
   const post: ServerPoster = async () => {
     throw new Error("server should not be called on the CLI path");
@@ -480,17 +485,42 @@ test("runSelfTest: CLI path transcribes the bundled clip as wav pinned to en", a
   const r = await runSelfTest({
     detection: cliDetection(),
     bytes: new Uint8Array([1, 2, 3]),
+    lang: "en",
     run: h.run,
     io: h.io,
     post,
   });
   expect(r.ok).toBe(true);
   expect(r.engine).toBe("whisper.cpp");
-  expect(r.text).toBe("and so my fellow americans");
+  expect(r.text).toBe("Sheep. Sheep. All I see is sheep.");
   // ffmpeg wrote a .wav and whisper was pinned to the clip's language (en)
   const whisperCall = h.calls.find((c) => c[0] === "/wc")!;
   expect(whisperCall).toContain("-l");
   expect(whisperCall[whisperCall.indexOf("-l") + 1]).toBe("en");
+});
+
+test("runSelfTest: the de clip pins whisper to German", async () => {
+  const h = harness((cmd) =>
+    cmd[0] === "/ff"
+      ? { exitCode: 0, stdout: "", stderr: "" }
+      : { exitCode: 0, stdout: "Schafe. Schafe. Ich sehe nur noch Schafe.\n", stderr: "" },
+  );
+  const post: ServerPoster = async () => {
+    throw new Error("server should not be called on the CLI path");
+  };
+  const r = await runSelfTest({
+    detection: cliDetection(),
+    bytes: new Uint8Array([1, 2, 3]),
+    lang: "de",
+    run: h.run,
+    io: h.io,
+    post,
+  });
+  expect(r.ok).toBe(true);
+  expect(r.lang).toBe("de");
+  expect(r.text).toBe("Schafe. Schafe. Ich sehe nur noch Schafe.");
+  const whisperCall = h.calls.find((c) => c[0] === "/wc")!;
+  expect(whisperCall[whisperCall.indexOf("-l") + 1]).toBe("de");
 });
 
 test("runSelfTest: server dead at POST but CLI ready → reports the ACTUAL backend (whisper.cpp)", async () => {
@@ -507,6 +537,7 @@ test("runSelfTest: server dead at POST but CLI ready → reports the ACTUAL back
   const r = await runSelfTest({
     detection: serverDetection({ ffmpeg: "/ff", binary: "/wc", model: "/m.bin" }),
     bytes: new Uint8Array([1, 2, 3]),
+    lang: "en",
     run: h.run,
     io: h.io,
     post,
@@ -523,6 +554,7 @@ test("runSelfTest: empty transcript is a handled failure (ok:false, no error)", 
   const r = await runSelfTest({
     detection: serverDetection(),
     bytes: new Uint8Array([1]),
+    lang: "en",
     run: h.run,
     io: h.io,
     post,
@@ -541,6 +573,7 @@ test("runSelfTest: engine failure is caught, never throws (ok:false with error)"
   const r = await runSelfTest({
     detection: serverDetection(), // no ffmpeg/binary/model → no fallback
     bytes: new Uint8Array([1]),
+    lang: "en",
     run: h.run,
     io: h.io,
     post,
@@ -550,51 +583,99 @@ test("runSelfTest: engine failure is caught, never throws (ok:false with error)"
   expect(r.engine).toBe("server");
 });
 
-test("formatSelfTestResult: success, empty, and error each render distinctly", () => {
-  const base: SelfTestResult = { ok: true, engine: "server", text: "hello there", ms: 840 };
+test("formatSelfTestResult: success, empty, and error each render distinctly (with the lang)", () => {
+  const base: SelfTestResult = { ok: true, lang: "de", engine: "server", text: "hello there", ms: 840 };
   expect(formatSelfTestResult(base)).toBe(
-    '✓ Test OK · faster-whisper server (whisper-stt) — "hello there" (840 ms)',
+    '✓ Test OK · de · faster-whisper server (whisper-stt) — "hello there" (840 ms)',
   );
   expect(formatSelfTestResult({ ...base, ok: false, text: "" })).toMatch(
-    /^✗ Test failed .*no text \(840 ms\)$/,
+    /^✗ Test failed \(de\) .*no text \(840 ms\)$/,
   );
   expect(formatSelfTestResult({ ...base, ok: false, text: "", error: "boom" })).toMatch(
-    /^✗ Test failed .*boom \(840 ms\)$/,
+    /^✗ Test failed \(de\) .*boom \(840 ms\)$/,
   );
+});
+
+test("resolveSelfTestLang: tolerant — de picks de, everything else falls back to en", () => {
+  expect(resolveSelfTestLang({ lang: "de" })).toBe("de");
+  expect(resolveSelfTestLang({ lang: "en" })).toBe("en");
+  // missing / invalid / non-JSON (null) / unsupported lang → en, never a throw
+  expect(resolveSelfTestLang(null)).toBe("en");
+  expect(resolveSelfTestLang(undefined)).toBe("en");
+  expect(resolveSelfTestLang({})).toBe("en");
+  expect(resolveSelfTestLang({ lang: "fr" })).toBe("en");
+  expect(resolveSelfTestLang({ lang: 42 })).toBe("en");
+  expect(resolveSelfTestLang("de")).toBe("en"); // a bare string is not { lang }
 });
 
 function findNode(view: ReturnType<typeof panelView>, type: string) {
   return (view.root.children ?? []).find((n) => n.type === type);
 }
+function findNodes(view: ReturnType<typeof panelView>, type: string) {
+  return (view.root.children ?? []).filter((n) => n.type === type);
+}
+const BOTH = { de: true, en: true } as const;
 
-test("panelView: offers the Test button only when an engine is ready and the clip loaded", () => {
-  const ready = panelView(cfg(), serverDetection(), null, true);
-  const btn = findNode(ready, "action-button");
-  expect(btn).toBeDefined();
-  expect(btn!.props?.route).toEqual({ method: "POST", path: "selftest" });
-  expect(btn!.props?.label).toBe("Test transcription");
+test("panelView: offers one Test button per language whose engine is ready and clip loaded", () => {
+  const ready = panelView(cfg(), serverDetection(), null, BOTH);
+  const btns = findNodes(ready, "action-button");
+  expect(btns.map((b) => b.props?.label)).toEqual(["Test (Deutsch)", "Test (English)"]);
+  for (const b of btns) expect(b.props?.route).toEqual({ method: "POST", path: "selftest" });
+  expect(btns.map((b) => b.props?.body)).toEqual([{ lang: "de" }, { lang: "en" }]);
 
-  // not ready → no button (the missing-piece callout is shown instead)
-  const notReady = panelView(cfg(), serverDetection({ engine: null, server: null }), null, true);
+  // not ready → no buttons (the missing-piece callout is shown instead)
+  const notReady = panelView(cfg(), serverDetection({ engine: null, server: null }), null, BOTH);
   expect(findNode(notReady, "action-button")).toBeUndefined();
   expect(findNode(notReady, "callout")).toBeDefined();
 
-  // ready but clip failed to load → no button
-  const noClip = panelView(cfg(), serverDetection(), null, false);
-  expect(findNode(noClip, "action-button")).toBeUndefined();
+  // ready but one clip failed to load → only the other language's button
+  const deOnly = panelView(cfg(), serverDetection(), null, { de: true, en: false });
+  expect(findNodes(deOnly, "action-button").map((b) => b.props?.label)).toEqual([
+    "Test (Deutsch)",
+  ]);
+  const noClips = panelView(cfg(), serverDetection(), null, { de: false, en: false });
+  expect(findNode(noClips, "action-button")).toBeUndefined();
 });
 
 test("panelView: 'last test' row reflects the most recent result", () => {
-  const never = panelView(cfg(), serverDetection(), null, true);
+  const never = panelView(cfg(), serverDetection(), null, BOTH);
   const pairs0 = findNode(never, "key-value")!.props!.pairs as { key: string; value: string }[];
   expect(pairs0.find((p) => p.key === "last test")!.value).toBe("never run");
 
   const done = panelView(
     cfg(),
     serverDetection(),
-    { ok: true, engine: "server", text: "hello", ms: 12 },
-    true,
+    { ok: true, lang: "de", engine: "server", text: "hello", ms: 12 },
+    BOTH,
   );
   const pairs1 = findNode(done, "key-value")!.props!.pairs as { key: string; value: string }[];
   expect(pairs1.find((p) => p.key === "last test")!.value).toContain('"hello"');
+});
+
+test("panelView: surfaces the test page path (the panel can't render links)", () => {
+  const view = panelView(cfg(), serverDetection(), null, BOTH);
+  const pairs = findNode(view, "key-value")!.props!.pairs as { key: string; value: string }[];
+  expect(pairs.find((p) => p.key === "test page")!.value).toBe(TEST_PAGE_PATH);
+  expect(TEST_PAGE_PATH).toBe("/api/plugins/voice-whisper/test");
+});
+
+test("testPageHtml: self-contained page wiring the mic recorder and both canned tests", () => {
+  const html = testPageHtml();
+  // renders inline as a document
+  expect(html).toStartWith("<!doctype html>");
+  // mic recorder posts to the SAME transcribe route the compose-bar mic uses (relative path)
+  expect(html).toContain('fetch("transcribe"');
+  expect(html).toContain("getUserMedia");
+  expect(html).toContain("MediaRecorder");
+  // canned self-tests hit the selftest route with the verbatim {lang} bodies
+  expect(html).toContain('fetch("selftest"');
+  expect(html).toContain('data-selftest="de"');
+  expect(html).toContain('data-selftest="en"');
+  // engine status line
+  expect(html).toContain('fetch("status"');
+  // self-contained: no external resources (all fetches are relative plugin routes)
+  expect(html).not.toContain("http://");
+  expect(html).not.toContain("https://");
+  // explains the secure-context requirement instead of failing mute
+  expect(html).toContain("secure context");
 });
