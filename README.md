@@ -61,6 +61,29 @@ The **Settings → Plugins** panel shows the server row plus which of the three 
 detected and which engine is selected, and the status row / `GET status` route carry a copy-paste
 hint for whatever is missing.
 
+### Test button
+
+When an engine is ready the panel shows a **Test transcription** button. Clicking it runs a small
+bundled speech clip (~3 s) through the **exact same pipeline the mic uses** and reports the result — so
+you can confirm end-to-end transcription actually works, not just that the binaries were detected:
+
+- **✓ on success**, with the recognised text and timing, e.g. `✓ Test OK · faster-whisper server (whisper-stt) — "And so, my fellow Americans." (840 ms)`.
+- **✗ with a reason** on failure (engine returned no text / unreachable).
+
+The one-line outcome appears as a toast **and** in a durable **`last test`** row in the panel — the row
+is the full, untruncated signal (the toast is neutral and truncated by the host, and pass/fail share the
+same toast styling). The test shares the same concurrency limit as live dictation, so testing while
+dictating just reports `busy`.
+
+> **The button only appears after you update the plugin _and restart Shepherd_.** Plugins load at
+> **boot only**, so right after merging/pulling this change the button is simply not loaded yet — that
+> is expected, not a failure. `git pull` in the plugin folder and restart Shepherd (see Install below).
+
+The clip is `assets/selftest-en.wav`, a ~3 s excerpt of `ggerganov/whisper.cpp`'s `samples/jfk.wav` — a
+**public-domain** US federal-government recording (JFK's 1961 inaugural), the canonical Whisper test
+sample. The self-test always pins its language to `en` to match the clip, regardless of the `language`
+config.
+
 > **whisper.cpp built from source but not on `PATH`?** Point `binaryPath` at it, e.g.
 > `"binaryPath": "/home/you/whisper.cpp/build/bin/whisper-cli"` — otherwise the CLI backend reports
 > `not found` even though the binary exists.
@@ -113,6 +136,10 @@ check to work — see [Releasing](#releasing).
 - `GET /api/plugins/voice-whisper/status` → `{ available, engine, server, model, ffmpeg, language,
   preferLocal, hint }`. `engine` is `"faster-whisper server (whisper-stt)"` / `"whisper.cpp"` / `null`;
   `server` is `{ url, model }` when a server is reachable, else `null`.
+- `POST /api/plugins/voice-whisper/selftest` — backs the panel's **Test transcription** button; runs
+  the bundled clip through the active engine. Ignores its request body and **always returns `200`**
+  with a plain-text `✓`/`✗`/`busy` message (the host's action-button discards the body of any non-2xx
+  in favour of a generic error toast, so failures are reported as `200` text too).
 
 ## Pipeline
 
