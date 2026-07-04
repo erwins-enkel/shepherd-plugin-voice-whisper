@@ -1,7 +1,8 @@
 {
   "id": "voice-whisper",
   "name": "Voice Input (local Whisper)",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "apiVersion": 1,
-  "capabilities": ["routes", "status"]
+  "capabilities": ["routes", "status"],
+  "repository": "https://github.com/erwins-enkel/shepherd-plugin-voice-whisper"
 }

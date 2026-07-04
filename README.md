@@ -76,8 +76,16 @@ git clone https://github.com/erwins-enkel/shepherd-plugin-voice-whisper \
 systemctl --user restart shepherd
 ```
 
-`git pull` in that folder + a restart updates it. When the plugin reports `available`, Shepherd's
-compose-bar mic uses it (see `preferLocal` for the browser-vs-local choice).
+When the plugin reports `available`, Shepherd's compose-bar mic uses it (see `preferLocal` for the
+browser-vs-local choice).
+
+**Updating.** Shepherd's plugin-update check compares the installed `version` against the highest
+semver **git tag** on the `repository` declared in `plugin.json`; a newer tag surfaces an
+**update-available** badge, and the **Update** button in Settings → Plugins (v1.42.0+) fetches and
+swaps the new version on disk for you. **Restart Shepherd afterwards** to load the new code
+(the swap only replaces the files; the running plugin keeps the old code until a restart). The
+manual equivalent is `git pull` in the plugin folder + a restart. Releases must be tagged for the
+check to work — see [Releasing](#releasing).
 
 ## Config (`config.json`, all optional)
 
@@ -135,6 +143,25 @@ WHISPER_SERVER_URL=http://127.0.0.1:9876 bun run smoke.ts /path/to/clip.wav de
 
 `types.ts` is vendored from Shepherd's `src/plugins/types.ts` (plugin API v1). If Shepherd bumps
 the plugin API, refresh it and bump `apiVersion` in `plugin.json`.
+
+## Releasing
+
+Shepherd checks for updates via the `repository` field in `plugin.json`: it reads the highest
+semver **git tag** on that repo and compares its `plugin.json` `version` against the installed one.
+So every release is two coupled steps — **skipping the tag makes the check report an error, not an
+update**:
+
+1. Bump `version` in **both** `plugin.json` and `package.json` (keep them in sync).
+2. After the change lands on `main`, push a matching tag:
+
+   ```sh
+   git tag v1.1.0        # must equal the version in plugin.json
+   git push origin v1.1.0
+   ```
+
+Use `vMAJOR.MINOR.PATCH`; the check parses the bare `MAJOR.MINOR.PATCH` out of the tag. A release
+whose `apiVersion` exceeds what the running Shepherd supports is surfaced as `incompatible` (not
+`update-available`), so it is never offered as a routine update.
 
 ## License
 
