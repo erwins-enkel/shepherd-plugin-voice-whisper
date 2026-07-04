@@ -61,28 +61,45 @@ The **Settings → Plugins** panel shows the server row plus which of the three 
 detected and which engine is selected, and the status row / `GET status` route carry a copy-paste
 hint for whatever is missing.
 
-### Test button
+### Test buttons
 
-When an engine is ready the panel shows a **Test transcription** button. Clicking it runs a small
-bundled speech clip (~3 s) through the **exact same pipeline the mic uses** and reports the result — so
-you can confirm end-to-end transcription actually works, not just that the binaries were detected:
+When an engine is ready the panel shows two buttons, **Test (Deutsch)** and **Test (English)**.
+Clicking one runs a small bundled speech clip (~2–4 s) through the **exact same pipeline the mic
+uses** and reports the result — so you can confirm end-to-end transcription actually works, not just
+that the binaries were detected:
 
-- **✓ on success**, with the recognised text and timing, e.g. `✓ Test OK · faster-whisper server (whisper-stt) — "And so, my fellow Americans." (840 ms)`.
+- **✓ on success**, with the recognised text and timing, e.g. `✓ Test OK · de · faster-whisper server (whisper-stt) — "Schafe. Schafe. Ich sehe nur noch Schafe." (840 ms)`.
 - **✗ with a reason** on failure (engine returned no text / unreachable).
+
+The self-test passes on any **non-empty transcript** — it proves engine health, not wording
+exactness; since the transcript is shown in full, you can eyeball the sentence yourself.
 
 The one-line outcome appears as a toast **and** in a durable **`last test`** row in the panel — the row
 is the full, untruncated signal (the toast is neutral and truncated by the host, and pass/fail share the
 same toast styling). The test shares the same concurrency limit as live dictation, so testing while
 dictating just reports `busy`.
 
-> **The button only appears after you update the plugin _and restart Shepherd_.** Plugins load at
-> **boot only**, so right after merging/pulling this change the button is simply not loaded yet — that
+> **The buttons only appear after you update the plugin _and restart Shepherd_.** Plugins load at
+> **boot only**, so right after merging/pulling this change the buttons are simply not loaded yet — that
 > is expected, not a failure. `git pull` in the plugin folder and restart Shepherd (see Install below).
 
-The clip is `assets/selftest-en.wav`, a ~3 s excerpt of `ggerganov/whisper.cpp`'s `samples/jfk.wav` — a
-**public-domain** US federal-government recording (JFK's 1961 inaugural), the canonical Whisper test
-sample. The self-test always pins its language to `en` to match the clip, regardless of the `language`
-config.
+The clips (`assets/selftest-de.wav`, `assets/selftest-en.wav`) are short **synthetic sentences
+generated with [Piper TTS](https://github.com/OHF-Voice/piper1-gpl)** (voices `de_DE-thorsten-medium`
+and `en_US-lessac-medium`), 16 kHz mono 16-bit WAV:
+
+- de: *„Schafe. Schafe. Ich sehe nur noch Schafe."*
+- en: *"Sheep. Sheep. All I see is sheep."*
+
+Each self-test pins its language to the clip's language, regardless of the `language` config.
+
+### Test page (speak yourself)
+
+The gear menu's **Voice input (Whisper) — test** entry opens `/api/plugins/voice-whisper/test`, a
+self-contained page bundling every test in one place: a **live microphone recorder** (record →
+transcribe via the same `transcribe` route the compose-bar mic uses, transcript shown in the page),
+the two canned self-test buttons, and the engine status. Open it on the HTTPS origin you use for
+Shepherd anyway — the recorder needs a secure context (HTTPS/localhost) for `getUserMedia`, and the
+page's requests ride your logged-in session cookie. The panel's `test page` row carries the path.
 
 > **whisper.cpp built from source but not on `PATH`?** Point `binaryPath` at it, e.g.
 > `"binaryPath": "/home/you/whisper.cpp/build/bin/whisper-cli"` — otherwise the CLI backend reports
@@ -136,10 +153,15 @@ check to work — see [Releasing](#releasing).
 - `GET /api/plugins/voice-whisper/status` → `{ available, engine, server, model, ffmpeg, language,
   preferLocal, hint }`. `engine` is `"faster-whisper server (whisper-stt)"` / `"whisper.cpp"` / `null`;
   `server` is `{ url, model }` when a server is reachable, else `null`.
-- `POST /api/plugins/voice-whisper/selftest` — backs the panel's **Test transcription** button; runs
-  the bundled clip through the active engine. Ignores its request body and **always returns `200`**
-  with a plain-text `✓`/`✗`/`busy` message (the host's action-button discards the body of any non-2xx
-  in favour of a generic error toast, so failures are reported as `200` text too).
+- `POST /api/plugins/voice-whisper/selftest` — backs the panel's and the test page's **Test
+  (Deutsch)/(English)** buttons; runs the bundled clip for the requested language through the active
+  engine. Accepts a JSON body `{ lang: "de" | "en" }`, parsed **tolerantly**: a missing/invalid body
+  (or an unsupported `lang`) falls back to `en` instead of erroring. **Always returns `200`** with a
+  plain-text `✓`/`✗`/`busy` message (the host's action-button discards the body of any non-2xx in
+  favour of a generic error toast, so failures are reported as `200` text too).
+- `GET /api/plugins/voice-whisper/test` — the operator test page (`text/html`): live mic recorder
+  posting to `transcribe`, the two canned self-test buttons, and the engine status. Opened by the
+  gear-menu item; needs a secure context (HTTPS/localhost) for recording.
 
 ## Pipeline
 
