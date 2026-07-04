@@ -20,7 +20,7 @@
 // contract, apiVersion 1) so this repo type-checks standalone. The `import type` line is
 // erased at runtime, so loading never depends on it.
 import type { PluginContext, PluginUIView } from "./types";
-import { mkdtemp, writeFile, rm, access, readdir } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, access, readdir, readFile } from "node:fs/promises";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 
@@ -451,6 +451,78 @@ export async function transcribeClip(opts: {
   });
 }
 
+// ── self-test (operator "Test transcription" button) ────────────────────────────────
+
+/** The bundled self-test clip: a ~3s public-domain excerpt of JFK's 1961 inaugural address
+ *  (from ggerganov/whisper.cpp `samples/jfk.wav` — a US federal-government recording, public domain).
+ *  16 kHz mono 16-bit WAV. The Settings-panel Test button runs it through the SAME `transcribeClip`
+ *  path the compose-bar mic uses, so a green result proves real end-to-end speech-to-text. */
+export const SELFTEST_CLIP_PATH = "assets/selftest-en.wav";
+/** The clip is English, so pin its language regardless of `config.language` — forcing another
+ *  language would garble a perfectly healthy engine and mis-report it as broken. */
+const SELFTEST_LANG = "en";
+
+export interface SelfTestResult {
+  /** True only when the engine returned a non-empty transcript. */
+  ok: boolean;
+  engine: Engine | null;
+  /** The transcript (trimmed; "" when the engine returned nothing or the run errored). */
+  text: string;
+  /** Wall-clock duration of the round-trip, milliseconds. */
+  ms: number;
+  /** Set when the run threw (engine unavailable / transcription failure); absent on a clean run. */
+  error?: string;
+}
+
+/** Run the bundled clip through whatever engine `detect()` chose — the exact `transcribeClip` path the
+ *  mic uses — and report the outcome. PASS = a non-empty transcript. A handled failure (engine gone,
+ *  transcription error) resolves to `{ ok:false, error }`; it never throws, so the route can always
+ *  answer 200 with a crafted message. */
+export async function runSelfTest(opts: {
+  detection: Detection;
+  bytes: Uint8Array;
+  run: CmdRunner;
+  io: TranscribeIO;
+  post: ServerPoster;
+  timeoutMs?: number;
+}): Promise<SelfTestResult> {
+  const engine = opts.detection.engine;
+  const t0 = performance.now();
+  try {
+    const text = (
+      await transcribeClip({
+        detection: opts.detection,
+        bytes: opts.bytes,
+        ext: "wav",
+        lang: SELFTEST_LANG,
+        run: opts.run,
+        io: opts.io,
+        post: opts.post,
+        timeoutMs: opts.timeoutMs,
+      })
+    ).trim();
+    return { ok: text.length > 0, engine, text, ms: Math.round(performance.now() - t0) };
+  } catch (e) {
+    return {
+      ok: false,
+      engine,
+      text: "",
+      ms: Math.round(performance.now() - t0),
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
+/** One short line for the action-button toast AND the panel's "last test" row. The ✓/✗ glyph carries
+ *  the outcome — core renders pass and fail as the same neutral toast (truncated ~200 chars), so the
+ *  untruncated panel row is the durable signal. */
+export function formatSelfTestResult(r: SelfTestResult): string {
+  const eng = engineLabel(r.engine) ?? "engine";
+  if (r.error) return `✗ Test failed via ${eng}: ${r.error} (${r.ms} ms)`;
+  if (!r.ok) return `✗ Test failed via ${eng}: engine returned no text (${r.ms} ms)`;
+  return `✓ Test OK · ${eng} — "${r.text}" (${r.ms} ms)`;
+}
+
 // ── real runtime adapters ────────────────────────────────────────────────────────────
 
 const realDetectDeps: DetectDeps = {
@@ -573,7 +645,13 @@ function statusBody(cfg: ResolvedConfig, d: Detection) {
   };
 }
 
-function panelView(cfg: ResolvedConfig, d: Detection): PluginUIView {
+export function panelView(
+  cfg: ResolvedConfig,
+  d: Detection,
+  lastTest: SelfTestResult | null,
+  /** Whether the bundled self-test clip loaded — the Test button is only offered when it did. */
+  testable: boolean,
+): PluginUIView {
   const available = d.engine !== null;
   const serverRow = d.server
     ? `✓ ${d.server.url} (model ${d.server.model})`
@@ -597,9 +675,28 @@ function panelView(cfg: ResolvedConfig, d: Detection): PluginUIView {
             { key: "language", value: cfg.language },
             { key: "prefer local", value: cfg.preferLocal ? "yes" : "no (browser first)" },
             { key: "status", value: available ? "ready" : "not ready" },
+            // The durable, untruncated test signal (the button's toast is neutral + truncated).
+            ...(available
+              ? [{ key: "last test", value: lastTest ? formatSelfTestResult(lastTest) : "never run" }]
+              : []),
           ],
         },
       },
+      // Only offer the Test button when an engine is ready AND the bundled clip loaded — otherwise a
+      // click would only ever report failure. When not ready the callout below explains what's missing.
+      ...(available && testable
+        ? [
+            {
+              type: "action-button",
+              props: {
+                label: "Test transcription",
+                tone: "info",
+                route: { method: "POST", path: "selftest" },
+                body: {},
+              },
+            } as const,
+          ]
+        : []),
       ...(available ? [] : [{ type: "callout", props: { tone: "warn", text: d.hint } } as const]),
     ],
   };
@@ -618,10 +715,26 @@ export async function register(ctx: PluginContext): Promise<() => void> {
   // interim loop silently skips that tick and retries on the next one.
   const gate = makeGate(cfg.maxConcurrent);
 
+  // Load the bundled self-test clip once at boot. A broken install (asset missing) must not crash
+  // load — we just log and withhold the Test button (panelView's `testable` flag).
+  let selfTestClip: Uint8Array | null = null;
+  try {
+    selfTestClip = new Uint8Array(await readFile(join(import.meta.dir, SELFTEST_CLIP_PATH)));
+  } catch (e) {
+    ctx.log.warn(
+      `self-test clip missing (${SELFTEST_CLIP_PATH}) — Test button disabled: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+
+  // Most recent self-test outcome, surfaced in the panel's "last test" row. In-memory only: resets to
+  // "never run" on restart (deliberately simple — the operator just re-runs the test).
+  let lastTest: SelfTestResult | null = null;
+
   const refreshPanel = async (): Promise<Detection> => {
     const d = await detect(cfg, realDetectDeps);
     ctx.publishStatus(statusBody(cfg, d));
-    if (typeof ctx.publishUI === "function") ctx.publishUI(panelView(cfg, d));
+    if (typeof ctx.publishUI === "function")
+      ctx.publishUI(panelView(cfg, d, lastTest, selfTestClip !== null));
     return d;
   };
 
@@ -677,6 +790,41 @@ export async function register(ctx: PluginContext): Promise<() => void> {
         return Response.json({ error: "voice engine not ready", hint: d.hint }, { status: 503 });
       ctx.log.warn(`transcribe failed: ${e instanceof Error ? e.message : String(e)}`);
       return Response.json({ error: "transcription failed" }, { status: 500 });
+    } finally {
+      gate.leave();
+    }
+  });
+
+  // POST selftest — the Settings-panel "Test transcription" button. Runs the bundled clip through the
+  // live engine to prove real end-to-end STT. EVERY handled outcome returns HTTP 200 with a plain-text
+  // ✓/✗/⏳ body: core's action-button throws on any non-2xx and then shows a FIXED generic "failed"
+  // toast, discarding our crafted message — so we must answer 200 even for failures.
+  ctx.route("POST", "selftest", async () => {
+    const d = await detect(cfg, realDetectDeps);
+    if (!d.engine) {
+      if (typeof ctx.publishUI === "function")
+        ctx.publishUI(panelView(cfg, d, lastTest, selfTestClip !== null));
+      return new Response(`✗ engine not ready — ${d.hint}`, { status: 200 });
+    }
+    if (!selfTestClip)
+      return new Response("✗ Test unavailable — the bundled test clip is missing from this install.", {
+        status: 200,
+      });
+    // Share the transcribe gate so a test never exceeds maxConcurrent alongside live dictation.
+    if (!gate.tryEnter(0))
+      return new Response("⏳ busy — an engine is transcribing, try again in a moment.", {
+        status: 200,
+      });
+    try {
+      lastTest = await runSelfTest({
+        detection: d,
+        bytes: selfTestClip,
+        run: realRun,
+        io: realIO,
+        post: realServerPost,
+      });
+      if (typeof ctx.publishUI === "function") ctx.publishUI(panelView(cfg, d, lastTest, true));
+      return new Response(formatSelfTestResult(lastTest), { status: 200 });
     } finally {
       gate.leave();
     }

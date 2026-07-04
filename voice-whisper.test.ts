@@ -14,12 +14,16 @@ import {
   transcribeClip,
   ServerUnavailable,
   makeGate,
+  runSelfTest,
+  formatSelfTestResult,
+  panelView,
   type ResolvedConfig,
   type Detection,
   type DetectDeps,
   type CmdResult,
   type ServerPoster,
   type TranscribeIO,
+  type SelfTestResult,
 } from "./index";
 
 function cfg(over: Partial<ResolvedConfig> = {}): ResolvedConfig {
@@ -426,4 +430,147 @@ test("makeGate reserves slots so low-priority callers never starve a high-priori
   // …and the final (reserved=0) always gets that reserved slot.
   expect(gate.tryEnter(0)).toBe(true);
   expect(gate.inFlight).toBe(3);
+});
+
+// ── self-test (the operator "Test transcription" button) ─────────────────────────────
+
+function cliDetection(over: Partial<Detection> = {}): Detection {
+  return {
+    engine: "whisper.cpp",
+    server: null,
+    ffmpeg: "/ff",
+    binary: "/wc",
+    model: "/m.bin",
+    hint: "",
+    ...over,
+  };
+}
+
+test("runSelfTest: server path returns ok with the transcript, engine and timing", async () => {
+  const post: ServerPoster = async () => ({
+    status: 200,
+    body: { text: "  And so, my fellow Americans. \n" },
+  });
+  const h = harness(() => ({ exitCode: 0, stdout: "", stderr: "" }));
+  const r = await runSelfTest({
+    detection: serverDetection(),
+    bytes: new Uint8Array([1, 2, 3]),
+    run: h.run,
+    io: h.io,
+    post,
+  });
+  expect(r.ok).toBe(true);
+  expect(r.engine).toBe("server");
+  expect(r.text).toBe("And so, my fellow Americans."); // trimmed
+  expect(r.error).toBeUndefined();
+  expect(typeof r.ms).toBe("number");
+  expect(r.ms).toBeGreaterThanOrEqual(0);
+  expect(h.calls.length).toBe(0); // server path never touches the CLI
+});
+
+test("runSelfTest: CLI path transcribes the bundled clip as wav pinned to en", async () => {
+  const h = harness((cmd) =>
+    cmd[0] === "/ff"
+      ? { exitCode: 0, stdout: "", stderr: "" }
+      : { exitCode: 0, stdout: "and so my fellow americans\n", stderr: "" },
+  );
+  const post: ServerPoster = async () => {
+    throw new Error("server should not be called on the CLI path");
+  };
+  const r = await runSelfTest({
+    detection: cliDetection(),
+    bytes: new Uint8Array([1, 2, 3]),
+    run: h.run,
+    io: h.io,
+    post,
+  });
+  expect(r.ok).toBe(true);
+  expect(r.engine).toBe("whisper.cpp");
+  expect(r.text).toBe("and so my fellow americans");
+  // ffmpeg wrote a .wav and whisper was pinned to the clip's language (en)
+  const whisperCall = h.calls.find((c) => c[0] === "/wc")!;
+  expect(whisperCall).toContain("-l");
+  expect(whisperCall[whisperCall.indexOf("-l") + 1]).toBe("en");
+});
+
+test("runSelfTest: empty transcript is a handled failure (ok:false, no error)", async () => {
+  const post: ServerPoster = async () => ({ status: 200, body: { text: "   " } });
+  const h = harness(() => ({ exitCode: 0, stdout: "", stderr: "" }));
+  const r = await runSelfTest({
+    detection: serverDetection(),
+    bytes: new Uint8Array([1]),
+    run: h.run,
+    io: h.io,
+    post,
+  });
+  expect(r.ok).toBe(false);
+  expect(r.text).toBe("");
+  expect(r.error).toBeUndefined();
+});
+
+test("runSelfTest: engine failure is caught, never throws (ok:false with error)", async () => {
+  // server chosen but unreachable at POST, and no CLI fallback → transcribeClip throws → caught here
+  const post: ServerPoster = async () => {
+    throw new Error("connection refused");
+  };
+  const h = harness(() => ({ exitCode: 0, stdout: "", stderr: "" }));
+  const r = await runSelfTest({
+    detection: serverDetection(), // no ffmpeg/binary/model → no fallback
+    bytes: new Uint8Array([1]),
+    run: h.run,
+    io: h.io,
+    post,
+  });
+  expect(r.ok).toBe(false);
+  expect(r.error).toBeTruthy();
+  expect(r.engine).toBe("server");
+});
+
+test("formatSelfTestResult: success, empty, and error each render distinctly", () => {
+  const base: SelfTestResult = { ok: true, engine: "server", text: "hello there", ms: 840 };
+  expect(formatSelfTestResult(base)).toBe(
+    '✓ Test OK · faster-whisper server (whisper-stt) — "hello there" (840 ms)',
+  );
+  expect(formatSelfTestResult({ ...base, ok: false, text: "" })).toMatch(
+    /^✗ Test failed .*no text \(840 ms\)$/,
+  );
+  expect(formatSelfTestResult({ ...base, ok: false, text: "", error: "boom" })).toMatch(
+    /^✗ Test failed .*boom \(840 ms\)$/,
+  );
+});
+
+function findNode(view: ReturnType<typeof panelView>, type: string) {
+  return (view.root.children ?? []).find((n) => n.type === type);
+}
+
+test("panelView: offers the Test button only when an engine is ready and the clip loaded", () => {
+  const ready = panelView(cfg(), serverDetection(), null, true);
+  const btn = findNode(ready, "action-button");
+  expect(btn).toBeDefined();
+  expect(btn!.props?.route).toEqual({ method: "POST", path: "selftest" });
+  expect(btn!.props?.label).toBe("Test transcription");
+
+  // not ready → no button (the missing-piece callout is shown instead)
+  const notReady = panelView(cfg(), serverDetection({ engine: null, server: null }), null, true);
+  expect(findNode(notReady, "action-button")).toBeUndefined();
+  expect(findNode(notReady, "callout")).toBeDefined();
+
+  // ready but clip failed to load → no button
+  const noClip = panelView(cfg(), serverDetection(), null, false);
+  expect(findNode(noClip, "action-button")).toBeUndefined();
+});
+
+test("panelView: 'last test' row reflects the most recent result", () => {
+  const never = panelView(cfg(), serverDetection(), null, true);
+  const pairs0 = findNode(never, "key-value")!.props!.pairs as { key: string; value: string }[];
+  expect(pairs0.find((p) => p.key === "last test")!.value).toBe("never run");
+
+  const done = panelView(
+    cfg(),
+    serverDetection(),
+    { ok: true, engine: "server", text: "hello", ms: 12 },
+    true,
+  );
+  const pairs1 = findNode(done, "key-value")!.props!.pairs as { key: string; value: string }[];
+  expect(pairs1.find((p) => p.key === "last test")!.value).toContain('"hello"');
 });
