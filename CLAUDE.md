@@ -7,7 +7,9 @@ Plugins render declarative views into host-defined slots only — this repo itse
 key-value rows and an action-button into the `settings-panel` slot — and cannot run browser
 JS (`getUserMedia`/`MediaRecorder`). There is no slot at arbitrary text fields, so mic
 buttons, audio capture, and live preview live in Shepherd core (`erwins-enkel/shepherd`,
-e.g. `ui/src/lib/components/ComposeBar.svelte`).
+e.g. `ui/src/lib/components/ComposeBar.svelte`). Concretely: the mic button for the
+New Task prompt field ships as core work via erwins-enkel/shepherd#1433 — it can never
+appear as a diff in this repo, whose `transcribe`/`status` routes already serve it unchanged.
 
 ## Convention: core gaps become core issues
 
