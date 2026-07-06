@@ -29,10 +29,13 @@ is never sent to an unrelated service. ⚠️ The **only** way audio leaves the 
 > and this repo is the **transcription engine**. On an iOS home-screen PWA — where the browser's Web
 > Speech API is unavailable — this is the **only** way to get a mic at all.
 >
-> The same split applies to every further input surface: a mic for the **New Task prompt field** is
-> core work, tracked in [erwins-enkel/shepherd#1433](https://github.com/erwins-enkel/shepherd/issues/1433)
-> — this repo's `transcribe`/`status` routes already serve it unchanged. See `CLAUDE.md` for the
-> convention.
+> The same split applies to every further input surface: the mic for the **New Task prompt field**
+> was delivered as core work via
+> [erwins-enkel/shepherd#1433](https://github.com/erwins-enkel/shepherd/issues/1433) — this repo's
+> `transcribe`/`status` routes serve it unchanged. The plugin-agnostic transcription-capability
+> contract is tracked in
+> [erwins-enkel/shepherd#1453](https://github.com/erwins-enkel/shepherd/issues/1453). See
+> `CLAUDE.md` for the convention.
 >
 > Requires a Shepherd build that includes the compose-bar voice hook (Shepherd #76). Without it the
 > routes still work, but nothing calls them.
