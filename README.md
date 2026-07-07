@@ -69,6 +69,42 @@ The **Settings → Plugins** panel shows the server row plus which of the three 
 detected and which engine is selected, and the status row / `GET status` route carry a copy-paste
 hint for whatever is missing.
 
+### Which engine did my dictation use?
+
+Start with the status/config signal; this often answers the question without new code or a test
+recording:
+
+- If `GET /api/plugins/voice-whisper/status` reports `available:true` and `preferLocal:false`, then
+  Android/desktop browsers keep using browser/device speech where Web Speech is available. A
+  `Browser/Geraet` source label is expected in that case. Set `"preferLocal": true` in this plugin's
+  `config.json` when you want Shepherd to prefer this plugin there.
+- If the faster-whisper server is remote/shared, set `serverUrl`. Auto-discovery only probes
+  `http://127.0.0.1:9876` on the Shepherd host, so an empty `serverUrl` will never discover a remote
+  server.
+- If `available:false`, fix the missing engine pieces first; `preferLocal` has no effect until the
+  plugin reports available.
+
+For an on-server confirmation of real ComposeBar dictation, watch the Shepherd user service log:
+
+```sh
+journalctl --user -u shepherd -f | grep 'transcribed via'
+```
+
+Successful final clips log `transcribed via faster-whisper server (whisper-stt)` or
+`transcribed via whisper.cpp`. Live-preview `mode=partial` clips are intentionally not logged, so
+the signal stays readable while dictating.
+
+Absence of this log is meaningful only after the updated plugin code is loaded. Shepherd loads
+plugins at boot, so after updating this plugin you must restart Shepherd:
+
+```sh
+systemctl --user restart shepherd
+```
+
+Once the new code is confirmed loaded, no final `transcribed via ...` line during real ComposeBar
+dictation means Shepherd did not call this plugin for the final transcript. If status was
+`available:true`, browser/device was used and the `Browser/Geraet` label is correct.
+
 ### Test buttons
 
 When an engine is ready the panel shows two buttons, **Test (Deutsch)** and **Test (English)**.
@@ -108,6 +144,11 @@ transcribe via the same `transcribe` route the compose-bar mic uses, transcript 
 the two canned self-test buttons, and the engine status. Open it on the HTTPS origin you use for
 Shepherd anyway — the recorder needs a secure context (HTTPS/localhost) for `getUserMedia`, and the
 page's requests ride your logged-in session cookie. The panel's `test page` row carries the path.
+
+The live recorder always posts directly to this plugin route. That proves the plugin can transcribe
+from the phone/browser, but it does **not** prove Shepherd core selected the plugin instead of the
+browser engine in the ComposeBar. Use the status/config checks and the `transcribed via ...` service
+log above for real ComposeBar source diagnosis.
 
 > **whisper.cpp built from source but not on `PATH`?** Point `binaryPath` at it, e.g.
 > `"binaryPath": "/home/you/whisper.cpp/build/bin/whisper-cli"` — otherwise the CLI backend reports
@@ -157,7 +198,8 @@ check to work — see [Releasing](#releasing).
   `{ text }`. `413` over `maxBytes`; `503` `{ error, hint }` when no engine is ready (also when the
   server was chosen but is unreachable at send time and no CLI fallback exists); `429`
   `{ error: "busy" }` when already at `maxConcurrent` — `mode=partial` requests keep a slot reserved
-  for the final, so a live preview can never shed the transcription the user actually keeps.
+  for the final, so a live preview can never shed the transcription the user actually keeps. Successful
+  final clips log the backend that actually produced the transcript; partial preview clips do not.
 - `GET /api/plugins/voice-whisper/status` → `{ available, engine, server, model, ffmpeg, language,
   preferLocal, hint }`. `engine` is `"faster-whisper server (whisper-stt)"` / `"whisper.cpp"` / `null`;
   `server` is `{ url, model }` when a server is reachable, else `null`.

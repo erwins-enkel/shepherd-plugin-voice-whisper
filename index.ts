@@ -691,6 +691,69 @@ function statusBody(cfg: ResolvedConfig, d: Detection) {
   };
 }
 
+export async function handleTranscribeRequest(opts: {
+  req: Request;
+  cfg: ResolvedConfig;
+  gate: ReturnType<typeof makeGate>;
+  log: Pick<PluginContext["log"], "log" | "warn">;
+  detectDeps: DetectDeps;
+  run: CmdRunner;
+  io: TranscribeIO;
+  post: ServerPoster;
+}): Promise<Response> {
+  // Reject oversized clips BEFORE ingesting the body: check Content-Length first so a huge
+  // upload is refused without buffering it (Bun.serve's default body limit won't protect us).
+  const declared = Number(opts.req.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > opts.cfg.maxBytes)
+    return Response.json({ error: "clip too large" }, { status: 413 });
+
+  const form = await opts.req.formData().catch(() => null);
+  const file = form?.get("file");
+  if (!(file instanceof File)) return Response.json({ error: "missing file field" }, { status: 400 });
+  // Authoritative cap on the actual received bytes (Content-Length may be absent/wrong).
+  if (file.size > opts.cfg.maxBytes)
+    return Response.json({ error: "clip too large" }, { status: 413 });
+
+  const d = await detect(opts.cfg, opts.detectDeps);
+  if (!d.engine)
+    return Response.json({ error: "voice engine not ready", hint: d.hint }, { status: 503 });
+
+  const langField = form?.get("lang");
+  const lang = resolveLang(opts.cfg, typeof langField === "string" ? langField : null);
+  const isPartial = form?.get("mode") === "partial";
+  // Shed rather than pile on when the host is already at capacity. A disposable `mode=partial`
+  // live-preview request leaves a slot reserved for the final clip, so previews can never
+  // 429-starve the transcription the user actually keeps; absent/other `mode` ⇒ treated as final.
+  const reserved = isPartial ? RESERVED_FOR_FINAL : 0;
+  if (!opts.gate.tryEnter(reserved)) return Response.json({ error: "busy" }, { status: 429 });
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let actualBackend: Engine | null = null;
+    const text = await transcribeClip({
+      detection: d,
+      bytes,
+      ext: extForMime(file.type),
+      lang,
+      run: opts.run,
+      io: opts.io,
+      post: opts.post,
+      onBackend: (engine) => {
+        actualBackend = engine;
+      },
+    });
+    if (!isPartial) opts.log.log(`transcribed via ${engineLabel(actualBackend) ?? "unknown"}`);
+    return Response.json({ text });
+  } catch (e) {
+    // Server chosen at detect() but gone at POST, with no CLI fallback → 503 (not ready), not 500.
+    if (e instanceof ServerUnavailable)
+      return Response.json({ error: "voice engine not ready", hint: d.hint }, { status: 503 });
+    opts.log.warn(`transcribe failed: ${e instanceof Error ? e.message : String(e)}`);
+    return Response.json({ error: "transcription failed" }, { status: 500 });
+  } finally {
+    opts.gate.leave();
+  }
+}
+
 /** Absolute path of the plugin-served test page (mic recorder + canned self-tests). Kept in one
  *  place because it appears in the gear item, the panel row, and the README. */
 export const TEST_PAGE_PATH = "/api/plugins/voice-whisper/test";
@@ -997,52 +1060,16 @@ export async function register(ctx: PluginContext): Promise<() => void> {
   // POST transcribe — multipart `file` (+ optional `lang`) → { text }. Re-detects each call so
   // dropping a model in after boot works without a restart.
   ctx.route("POST", "transcribe", async (req) => {
-    // Reject oversized clips BEFORE ingesting the body: check Content-Length first so a huge
-    // upload is refused without buffering it (Bun.serve's default body limit won't protect us).
-    const declared = Number(req.headers.get("content-length") ?? "");
-    if (Number.isFinite(declared) && declared > cfg.maxBytes)
-      return Response.json({ error: "clip too large" }, { status: 413 });
-
-    const form = await req.formData().catch(() => null);
-    const file = form?.get("file");
-    if (!(file instanceof File))
-      return Response.json({ error: "missing file field" }, { status: 400 });
-    // Authoritative cap on the actual received bytes (Content-Length may be absent/wrong).
-    if (file.size > cfg.maxBytes)
-      return Response.json({ error: "clip too large" }, { status: 413 });
-
-    const d = await detect(cfg, realDetectDeps);
-    if (!d.engine)
-      return Response.json({ error: "voice engine not ready", hint: d.hint }, { status: 503 });
-
-    const langField = form?.get("lang");
-    const lang = resolveLang(cfg, typeof langField === "string" ? langField : null);
-    // Shed rather than pile on when the host is already at capacity. A disposable `mode=partial`
-    // live-preview request leaves a slot reserved for the final clip, so previews can never
-    // 429-starve the transcription the user actually keeps; absent/other `mode` ⇒ treated as final.
-    const reserved = form?.get("mode") === "partial" ? RESERVED_FOR_FINAL : 0;
-    if (!gate.tryEnter(reserved)) return Response.json({ error: "busy" }, { status: 429 });
-    try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const text = await transcribeClip({
-        detection: d,
-        bytes,
-        ext: extForMime(file.type),
-        lang,
-        run: realRun,
-        io: realIO,
-        post: realServerPost,
-      });
-      return Response.json({ text });
-    } catch (e) {
-      // Server chosen at detect() but gone at POST, with no CLI fallback → 503 (not ready), not 500.
-      if (e instanceof ServerUnavailable)
-        return Response.json({ error: "voice engine not ready", hint: d.hint }, { status: 503 });
-      ctx.log.warn(`transcribe failed: ${e instanceof Error ? e.message : String(e)}`);
-      return Response.json({ error: "transcription failed" }, { status: 500 });
-    } finally {
-      gate.leave();
-    }
+    return handleTranscribeRequest({
+      req,
+      cfg,
+      gate,
+      log: ctx.log,
+      detectDeps: realDetectDeps,
+      run: realRun,
+      io: realIO,
+      post: realServerPost,
+    });
   });
 
   // POST selftest — the panel's / test page's "Test (Deutsch)/(English)" buttons. Runs the bundled

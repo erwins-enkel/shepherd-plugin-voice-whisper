@@ -14,6 +14,7 @@ import {
   transcribeClip,
   ServerUnavailable,
   makeGate,
+  handleTranscribeRequest,
   runSelfTest,
   formatSelfTestResult,
   resolveSelfTestLang,
@@ -344,6 +345,47 @@ function serverDetection(over: Partial<Detection> = {}): Detection {
     ...over,
   };
 }
+
+function transcribeRequest(mode?: string): Request {
+  const form = new FormData();
+  form.set("file", new File([new Uint8Array([1, 2, 3])], "clip.webm", { type: "audio/webm" }));
+  if (mode !== undefined) form.set("mode", mode);
+  return new Request("http://plugin/transcribe", { method: "POST", body: form });
+}
+
+test("handleTranscribeRequest logs successful final clips but not partial previews", async () => {
+  const logs: string[] = [];
+  const deps = detectDeps({ probeServer: async () => ({ model: "medium" }) });
+  const post: ServerPoster = async () => ({ status: 200, body: { text: "server text" } });
+  const h = harness(() => ({ exitCode: 0, stdout: "should not run", stderr: "" }));
+  const base = {
+    cfg: cfg({ serverUrl: "http://s:9876" }),
+    log: { log: (msg: unknown) => logs.push(String(msg)), warn: () => {} },
+    detectDeps: deps,
+    run: h.run,
+    io: h.io,
+    post,
+  };
+
+  const partial = await handleTranscribeRequest({
+    ...base,
+    req: transcribeRequest("partial"),
+    gate: makeGate(3),
+  });
+  expect(partial.status).toBe(200);
+  expect(await partial.json()).toEqual({ text: "server text" });
+  expect(logs).toEqual([]);
+
+  const final = await handleTranscribeRequest({
+    ...base,
+    req: transcribeRequest(),
+    gate: makeGate(3),
+  });
+  expect(final.status).toBe(200);
+  expect(await final.json()).toEqual({ text: "server text" });
+  expect(logs).toEqual(["transcribed via faster-whisper server (whisper-stt)"]);
+  expect(h.calls.length).toBe(0);
+});
 
 test("transcribeClip: server down at POST degrades to the CLI when it is ready", async () => {
   const h = harness((cmd) =>
