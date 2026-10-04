@@ -29,8 +29,9 @@ unabhängig geprüft · **[M]** = selbst gemessen (Abschnitt 3) · **[I]** = eig
   sie nicht [V].
 - **Empfehlung:** Als Erstes **(E)**: ein Auto-Install für den *bestehenden* whisper.cpp-Pfad (ein
   Knopf lädt die fertige Linux-Binary und das Modell `ggml-small` mit gepinntem SHA256). Das
-  beseitigt das „Modell vergessen"-Problem ohne Qualitätsverlust. Dazu ein **Core-Issue (F)**:
-  Wenn der Browser 16-kHz-WAV schickt, braucht kein Engine mehr ffmpeg. Whistle selbst ist
+  beseitigt das „Modell vergessen"-Problem ohne Qualitätsverlust. Dazu **(F)**: Wenn alle Clips als
+  16-kHz-WAV ankommen, braucht keine Engine mehr ffmpeg. *Korrektur:* Die Web-Vorschau und die iOS-App
+  schicken bereits WAV, offen ist nur der finale Web-Clip (siehe Nachtrag unten). Whistle selbst ist
   höchstens eine **spätere Opt-in-Engine** für schnelle `mode=partial`-Vorschauen **(G)** oder für
   sehr schwache Hardware, und erst, wenn die Engine gereift ist.
 - **Die Lizenz blockiert nichts:** Gewichte und Engine-Binaries stehen unter **Apache-2.0** [V].
@@ -297,7 +298,7 @@ ist erwins-enkel/shepherd#1453 (Contract für eine Transkriptions-Capability).
 | **C** | Whistle in-process über `bun:ffi` oder WASM | Plugin | M–L | gemessen nur ~20–40 ms Ersparnis | Globales, **nicht threadsicheres** Modell pro Prozess, d. h. alle Aufrufe (auch Partials) müssen serialisiert werden. Synchrones FFI blockiert den Event-Loop von Shepherd für 0,05–2 s, sofern es nicht in einem Worker läuft. Ein nativer Absturz reißt **ganz Shepherd** mit, weil das Plugin in-process läuft. `.so` gibt es nur im Wheel. WASM ist 4–8× langsamer. **Nicht empfohlen** |
 | **D** | Auto-Install für Whistle (Action-Button im Settings-Panel) | Plugin | S (~1 Tag zusätzlich zu B) | Ein Klick lädt 18,4 MB in Sekunden, keine Python-Abhängigkeit | Hilft nur zusammen mit B. Löst **ffmpeg nicht**. Kein Intel-Mac. Keine Signaturen, Vertrauen in HF und den Cactus-Account; Pin auf Commit plus fest eincodierter SHA256 mildert das ab. Nicht über `pip` (Telemetrie) |
 | **E** | **Auto-Install für den bestehenden whisper.cpp-Pfad** | Plugin | S–M | Beseitigt den in der README genannten Hauptstolperstein („Homebrew installs … no model“) **ohne Qualitätsverlust** (small 8,9 %) | 466 MiB Download (~22 s hier) muss asynchron laufen, mit Fortschritt per `publishUI`. Die Binary gibt es nur für Linux x64 (glibc ≥ 2.34, `GLIBCXX_3.4.29`), unter macOS bleibt `brew`. ffmpeg bleibt nötig |
-| **F** | Browser schickt 16-kHz-PCM-WAV, wenn das Plugin es anfordert | **Core-Issue** | M (Core) | Kein ffmpeg mehr für *jede* CLI-Engine (whisper.cpp und Whistle lesen WAV). Damit wird ein Auto-Install wirklich „1 Klick“ | iOS-PWA und AudioWorklet ungeprüft. 32 KB/s, also 60 s ≈ 1,9 MB (unter `maxBytes` 25 MiB). Muss generisch sein, etwa ein deklariertes `accepts: ["audio/wav;rate=16000"]` im Rahmen von #1453 |
+| **F** | Alle Clips kommen als 16-kHz-PCM-WAV an. *Korrigiert:* Web-Vorschau und iOS-App tun das schon, offen ist nur der finale Web-Clip | **Core-Issue** (erwins-enkel/shepherd#2724) + Plugin (#15) | S–M | Kein ffmpeg mehr für *jede* CLI-Engine (whisper.cpp und Whistle lesen WAV). Damit wird ein Auto-Install wirklich „1 Klick“ | Für das Web-Finale aus dem schon erfassten PCM: ScriptProcessor auf der iOS-PWA über den ganzen Clip ungeprüft. 32 KB/s, also 60 s ≈ 1,9 MB (unter `maxBytes` 25 MiB). Ein einheitliches Format im Core ist plugin-agnostisch, passend zu #1453 |
 | **G** | Hybrid: Whistle nur für `mode=partial`, das finale Transkript über Server oder whisper.cpp | Plugin (setzt B und D voraus) | S zusätzlich zu B | Schnelle Vorschauen (<150 ms in den ersten 5 s, statt ≥2,2 s mit turbo). Das Finale behält Whisper-Qualität. Der Unterschied zwischen `partial` und finalem Clip existiert in der Route schon | Vorschau-Text ist sichtbar schlechter und springt beim Finale. Lohnt nur, wenn die Latenz der Vorschau wirklich stört. Opt-in |
 | **H** | Sonstiges (kurz) | – | – | **Parakeet TDT 0.6B v3** (NVIDIA, CC-BY-4.0, 25 Sprachen, FLEURS-de **5,04** laut Model Card [C]). whisper.cpp 1.9.4 liefert `parakeet-cli` bereits im selben Linux-Tarball mit [V], aber es gibt kein offizielles ggml-Modell zum Download (nur `models/convert-parakeet-to-ggml.py`) [V]. Das wäre die interessantere „kleine, aber gute“ Alternative und verdient eine eigene Prüfung. **Moonshine:** laut Whistle-Card nur Englisch, für uns irrelevant. **WASM im Browser (Core):** technisch möglich (siehe Whistle-Demo im Blog), gleiche Qualitätsgrenze, Core-Arbeit. **`whisper-server`** (ebenfalls im Tarball) spricht `/inference`, nicht unseren `/health`+`/transcribe`-Contract | |
 
@@ -323,8 +324,8 @@ schon im Plugin ist [V].
 
 **Empfohlene Reihenfolge:**
 
-1. **E** jetzt.
-2. **F** als Core-Issue.
+1. **E** jetzt (angelegt als #14).
+2. **F**: erwins-enkel/shepherd#2724 (Web-Finale als WAV) und #15 (WAV ohne ffmpeg im Plugin).
 3. **B, D, G** erneut prüfen, wenn (a) die Streaming-API in einer veröffentlichten Engine angekommen
    ist, (b) Cactus WER pro Sprache veröffentlicht oder wir einen eigenen FLEURS-de-Lauf haben,
    (c) der x86-Latenzsprung geklärt ist und (d) die CLI- und C-API einige Wochen stabil war.
@@ -385,3 +386,19 @@ schon im Plugin ist [V].
   (`action-button`, `publishUI`)
 - Lokaler whisper-stt-Server auf diesem Host (nicht Teil des Repos): `~/.openclaw/skills-repo/whisper-stt/scripts/server.py`,
   gestartet mit `--model large-v3-turbo --threads 12` (faster-whisper, `device="cpu"`, `compute_type="int8"`, `beam_size=5`, `vad_filter=True`)
+
+---
+
+## Nachtrag: Clip-Formate der Clients (später am selben Tag geprüft)
+
+Die Annahme hinter Option F war zu pessimistisch. In Shepherd core (origin/main `26a51234`) gilt:
+
+- **Web-Vorschau** (`mode=partial`): Web-Audio-PCM geht als 16-kHz-Mono-PCM16-WAV raus
+  (`ui/src/lib/wav.ts`, `dictation.svelte.ts` → `runInterim()`).
+- **Native iOS-App**: auch die finalen Clips sind 16-kHz-PCM-WAV
+  (`native/Sources/ShepherdKit/Client/ShepherdClient+Voice.swift`, `DictationWAV.swift`).
+- **Nur der finale Web-Clip** ist noch MediaRecorder webm/mp4 (`finishLocalRecording()`).
+
+Daraus entstanden erwins-enkel/shepherd#2724 (Web-Finale als WAV aus dem schon erfassten PCM) und #15
+(Plugin reicht 16-kHz-WAV ohne ffmpeg direkt an whisper-cli durch). Der Vergleich mit anderen
+STT-Modellen steht in [`stt-modellvergleich.md`](./stt-modellvergleich.md).
